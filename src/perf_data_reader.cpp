@@ -338,14 +338,97 @@ PerfEventType PerfDataReader::classify_event(size_t attr_index) const {
     if (name.find("python:drop_gil") != std::string::npos) {
         return PerfEventType::DropGil;
     }
+    // NVIDIA CUDA probes — order matters: check more specific names first
+    // Kernel launch
+    if (name.find("nvidia:launch_ret") != std::string::npos) {
+        return PerfEventType::NvidiaLaunchReturn;
+    }
     if (name.find("nvidia:launch") != std::string::npos) {
         return PerfEventType::NvidiaLaunch;
     }
-    if (name.find("nvidia:sync_start") != std::string::npos) {
-        return PerfEventType::NvidiaSyncStart;
+    // Stream synchronize
+    if (name.find("nvidia:stream_sync_ret") != std::string::npos) {
+        return PerfEventType::NvidiaStreamSyncReturn;
     }
-    if (name.find("nvidia:sync_end") != std::string::npos) {
-        return PerfEventType::NvidiaSyncEnd;
+    if (name.find("nvidia:stream_sync") != std::string::npos) {
+        return PerfEventType::NvidiaStreamSync;
+    }
+    // Device synchronize
+    if (name.find("nvidia:dev_sync_ret") != std::string::npos) {
+        return PerfEventType::NvidiaDeviceSyncReturn;
+    }
+    if (name.find("nvidia:dev_sync") != std::string::npos) {
+        return PerfEventType::NvidiaDeviceSync;
+    }
+    // Event synchronize
+    if (name.find("nvidia:event_sync_ret") != std::string::npos) {
+        return PerfEventType::NvidiaEventSyncReturn;
+    }
+    if (name.find("nvidia:event_sync") != std::string::npos) {
+        return PerfEventType::NvidiaEventSync;
+    }
+    // Memory transfers — check return variants first
+    if (name.find("nvidia:memcpy_htod_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyHtoDReturn;
+    }
+    if (name.find("nvidia:memcpy_htod") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyHtoD;
+    }
+    if (name.find("nvidia:memcpy_dtoh_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyDtoHReturn;
+    }
+    if (name.find("nvidia:memcpy_dtoh") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyDtoH;
+    }
+    if (name.find("nvidia:memcpy_dtod_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyDtoDReturn;
+    }
+    if (name.find("nvidia:memcpy_dtod") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyDtoD;
+    }
+    if (name.find("nvidia:memcpy_async_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyAsyncReturn;
+    }
+    if (name.find("nvidia:memcpy_async") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyAsync;
+    }
+    if (name.find("nvidia:memcpy_peer_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyPeerReturn;
+    }
+    if (name.find("nvidia:memcpy_peer") != std::string::npos) {
+        return PerfEventType::NvidiaMemcpyPeer;
+    }
+    // Memory allocation
+    if (name.find("nvidia:malloc_ret") != std::string::npos) {
+        return PerfEventType::NvidiaMallocReturn;
+    }
+    if (name.find("nvidia:malloc") != std::string::npos) {
+        return PerfEventType::NvidiaMalloc;
+    }
+    if (name.find("nvidia:free_ret") != std::string::npos) {
+        return PerfEventType::NvidiaFreeReturn;
+    }
+    if (name.find("nvidia:free") != std::string::npos) {
+        return PerfEventType::NvidiaFree;
+    }
+    // NCCL probes
+    if (name.find("nccl:allreduce_ret") != std::string::npos) {
+        return PerfEventType::NcclAllReduceReturn;
+    }
+    if (name.find("nccl:allreduce") != std::string::npos) {
+        return PerfEventType::NcclAllReduce;
+    }
+    if (name.find("nccl:broadcast_ret") != std::string::npos) {
+        return PerfEventType::NcclBroadcastReturn;
+    }
+    if (name.find("nccl:broadcast") != std::string::npos) {
+        return PerfEventType::NcclBroadcast;
+    }
+    if (name.find("nccl:reducescatter_ret") != std::string::npos) {
+        return PerfEventType::NcclReduceScatterReturn;
+    }
+    if (name.find("nccl:reducescatter") != std::string::npos) {
+        return PerfEventType::NcclReduceScatter;
     }
 
     return PerfEventType::Other;

@@ -164,25 +164,215 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         break;
     }
 
+    // --- NVIDIA CUDA events ---
     case PerfEventType::NvidiaLaunch: {
-        if (!passes_filter(event.pid)) return;
-        writer_.write_instant("cuLaunchKernel", "gpu", ts_us,
-                              event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaSyncStart: {
-        if (!passes_filter(event.pid)) return;
-        writer_.write_begin("cuStreamSynchronize", "gpu", ts_us,
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuLaunchKernel", "gpu", ts_us,
                             event.pid, event.tid);
         perf_written_++;
         break;
     }
+    case PerfEventType::NvidiaLaunchReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuLaunchKernel", "gpu", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
 
-    case PerfEventType::NvidiaSyncEnd: {
-        if (!passes_filter(event.pid)) return;
-        writer_.write_end("cuStreamSynchronize", "gpu", ts_us,
+    case PerfEventType::NvidiaStreamSync: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuStreamSynchronize", "gpu.sync", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaStreamSyncReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuStreamSynchronize", "gpu.sync", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaDeviceSync: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cudaDeviceSynchronize", "gpu.sync", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaDeviceSyncReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cudaDeviceSynchronize", "gpu.sync", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaEventSync: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuEventSynchronize", "gpu.sync", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaEventSyncReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuEventSynchronize", "gpu.sync", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    // --- Memory transfers ---
+    case PerfEventType::NvidiaMemcpyHtoD: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemcpyHtoD", "gpu.memcpy", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMemcpyHtoDReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemcpyHtoD", "gpu.memcpy", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaMemcpyDtoH: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemcpyDtoH", "gpu.memcpy", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMemcpyDtoHReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemcpyDtoH", "gpu.memcpy", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaMemcpyDtoD: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemcpyDtoD", "gpu.memcpy", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMemcpyDtoDReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemcpyDtoD", "gpu.memcpy", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaMemcpyAsync: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemcpyAsync", "gpu.memcpy", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMemcpyAsyncReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemcpyAsync", "gpu.memcpy", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaMemcpyPeer: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemcpyPeerAsync", "gpu.memcpy", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMemcpyPeerReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemcpyPeerAsync", "gpu.memcpy", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    // --- Memory allocation ---
+    case PerfEventType::NvidiaMalloc: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemAlloc", "gpu.alloc", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaMallocReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemAlloc", "gpu.alloc", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NvidiaFree: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("cuMemFree", "gpu.alloc", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NvidiaFreeReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("cuMemFree", "gpu.alloc", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    // --- NCCL collectives ---
+    case PerfEventType::NcclAllReduce: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("ncclAllReduce", "nccl", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NcclAllReduceReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("ncclAllReduce", "nccl", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NcclBroadcast: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("ncclBroadcast", "nccl", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NcclBroadcastReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("ncclBroadcast", "nccl", ts_us,
+                          event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+
+    case PerfEventType::NcclReduceScatter: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_begin("ncclReduceScatter", "nccl", ts_us,
+                            event.pid, event.tid);
+        perf_written_++;
+        break;
+    }
+    case PerfEventType::NcclReduceScatterReturn: {
+        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
+        writer_.write_end("ncclReduceScatter", "nccl", ts_us,
                           event.pid, event.tid);
         perf_written_++;
         break;
