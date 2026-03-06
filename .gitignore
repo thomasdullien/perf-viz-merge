@@ -1,0 +1,7 @@
+# Build artifacts
+*.o
+*.d
+perf-viz-merge
+
+# Test output
+test/output/

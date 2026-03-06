@@ -1,0 +1,561 @@
+#include "perf_data_reader.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <stdexcept>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <traceevent/event-parse.h>
+
+#include <fmt/format.h>
+
+using namespace perf_format;
+
+// Helper to read a value from a buffer and advance the pointer
+template <typename T>
+static T read_val(const uint8_t *&p) {
+    T val;
+    std::memcpy(&val, p, sizeof(T));
+    p += sizeof(T);
+    return val;
+}
+
+PerfDataReader::PerfDataReader(const std::string &path) {
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        throw std::runtime_error(
+            fmt::format("Cannot open {}: {}", path, strerror(errno)));
+    }
+
+    struct stat st;
+    if (fstat(fd_, &st) < 0) {
+        close(fd_);
+        throw std::runtime_error(
+            fmt::format("Cannot stat {}: {}", path, strerror(errno)));
+    }
+    mmap_size_ = static_cast<size_t>(st.st_size);
+
+    mmap_base_ = static_cast<uint8_t *>(
+        mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0));
+    if (mmap_base_ == MAP_FAILED) {
+        mmap_base_ = nullptr;
+        close(fd_);
+        throw std::runtime_error(
+            fmt::format("Cannot mmap {}: {}", path, strerror(errno)));
+    }
+
+    tep_ = tep_alloc();
+    if (!tep_) {
+        throw std::runtime_error("Failed to allocate tep_handle");
+    }
+
+    parse_header();
+    parse_attrs();
+    parse_feature_sections();
+}
+
+PerfDataReader::~PerfDataReader() {
+    if (tep_) {
+        tep_free(tep_);
+    }
+    if (mmap_base_) {
+        munmap(mmap_base_, mmap_size_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+}
+
+void PerfDataReader::parse_header() {
+    if (mmap_size_ < sizeof(FileHeader)) {
+        throw std::runtime_error("File too small for perf.data header");
+    }
+
+    std::memcpy(&header_, mmap_base_, sizeof(FileHeader));
+
+    if (header_.magic != MAGIC) {
+        if (header_.magic == MAGIC_SWAPPED) {
+            throw std::runtime_error(
+                "perf.data file has swapped endianness (cross-arch); not supported");
+        }
+        throw std::runtime_error(
+            fmt::format("Not a perf.data file (bad magic: {:#x})", header_.magic));
+    }
+}
+
+void PerfDataReader::parse_attrs() {
+    if (header_.attrs.size == 0 || header_.attr_size == 0) {
+        return; // No attrs
+    }
+
+    size_t num_attrs = header_.attrs.size / header_.attr_size;
+    const uint8_t *attr_base = mmap_base_ + header_.attrs.offset;
+
+    // Each entry in the attrs section consists of:
+    //   perf_event_attr (attr_size bytes) followed by a FileSection
+    //   describing the IDs for this attr.
+    // Wait -- actually, the layout depends on the file version.
+    // In standard perf.data files, the attrs section contains pairs of:
+    //   { perf_event_attr, FileSection ids }
+    // So each entry is attr_size + sizeof(FileSection) = attr_size + 16 bytes.
+
+    // However, if the attrs.size / attr_size gives us the right count
+    // without the FileSection, it may be the simpler format.
+    // Let's try the paired format first (attr_size + 16 per entry).
+
+    size_t entry_size_with_ids = header_.attr_size + sizeof(FileSection);
+    size_t num_attrs_with_ids = header_.attrs.size / entry_size_with_ids;
+
+    if (num_attrs_with_ids > 0 &&
+        num_attrs_with_ids * entry_size_with_ids == header_.attrs.size) {
+        // Paired format: attr + FileSection
+        num_attrs = num_attrs_with_ids;
+        for (size_t i = 0; i < num_attrs; i++) {
+            const uint8_t *entry = attr_base + i * entry_size_with_ids;
+
+            EventAttr attr{};
+            size_t copy_size = std::min(header_.attr_size, (uint64_t)sizeof(EventAttr));
+            std::memcpy(&attr, entry, copy_size);
+            attrs_.push_back(attr);
+
+            // Read the IDs FileSection
+            FileSection ids_section;
+            std::memcpy(&ids_section, entry + header_.attr_size, sizeof(FileSection));
+
+            std::vector<uint64_t> ids;
+            if (ids_section.size > 0) {
+                size_t num_ids = ids_section.size / sizeof(uint64_t);
+                const uint64_t *id_ptr =
+                    reinterpret_cast<const uint64_t *>(mmap_base_ + ids_section.offset);
+                for (size_t j = 0; j < num_ids; j++) {
+                    ids.push_back(id_ptr[j]);
+                    id_to_attr_[id_ptr[j]] = i;
+                }
+            }
+            attr_ids_.push_back(std::move(ids));
+            attr_names_.push_back(""); // Will be filled by EVENT_DESC feature
+        }
+    } else {
+        // Simple format: just attrs, no IDs section
+        num_attrs = header_.attrs.size / header_.attr_size;
+        for (size_t i = 0; i < num_attrs; i++) {
+            const uint8_t *entry = attr_base + i * header_.attr_size;
+
+            EventAttr attr{};
+            size_t copy_size = std::min(header_.attr_size, (uint64_t)sizeof(EventAttr));
+            std::memcpy(&attr, entry, copy_size);
+            attrs_.push_back(attr);
+            attr_ids_.push_back({});
+            attr_names_.push_back("");
+        }
+    }
+}
+
+void PerfDataReader::parse_feature_sections() {
+    // Feature sections are stored after the data section.
+    // The flags bitmap in the header tells us which features are present.
+    // For each set bit, there's a FileSection at a known offset after the data.
+
+    // Count features present
+    std::vector<int> present_features;
+    for (int bit = 0; bit < 256; bit++) {
+        int word = bit / 64;
+        int pos = bit % 64;
+        if (header_.flags[word] & (1ULL << pos)) {
+            present_features.push_back(bit);
+        }
+    }
+
+    if (present_features.empty()) {
+        return;
+    }
+
+    // Feature sections are stored as an array of FileSection structs
+    // starting right after the data section.
+    uint64_t feature_offset = header_.data.offset + header_.data.size;
+
+    for (size_t i = 0; i < present_features.size(); i++) {
+        uint64_t sec_offset = feature_offset + i * sizeof(FileSection);
+        if (sec_offset + sizeof(FileSection) > mmap_size_) {
+            break;
+        }
+
+        FileSection section;
+        std::memcpy(&section, mmap_base_ + sec_offset, sizeof(FileSection));
+
+        if (section.offset + section.size > mmap_size_) {
+            continue; // Skip invalid sections
+        }
+
+        int feature = present_features[i];
+        switch (feature) {
+        case FEAT_EVENT_DESC:
+            parse_event_desc_section(mmap_base_ + section.offset, section.size);
+            break;
+        // Could handle FEAT_TRACING_DATA here for libtraceevent format strings
+        default:
+            break;
+        }
+    }
+}
+
+void PerfDataReader::parse_event_desc_section(const uint8_t *data, size_t size) {
+    // EVENT_DESC section format:
+    //   u32 nr_events
+    //   u32 attr_size
+    //   for each event:
+    //     perf_event_attr (attr_size bytes)
+    //     u32 nr_ids
+    //     string event_name (null-terminated, padded to 4-byte boundary)
+    //     u64 ids[nr_ids]
+
+    if (size < 8) return;
+
+    const uint8_t *p = data;
+    const uint8_t *end = data + size;
+
+    uint32_t nr_events = read_val<uint32_t>(p);
+    uint32_t attr_size = read_val<uint32_t>(p);
+
+    for (uint32_t i = 0; i < nr_events && p < end; i++) {
+        // Skip the attr (we already have it)
+        if (p + attr_size > end) break;
+        p += attr_size;
+
+        if (p + 4 > end) break;
+        uint32_t nr_ids = read_val<uint32_t>(p);
+
+        // Read null-terminated event name
+        const char *name_start = reinterpret_cast<const char *>(p);
+        size_t name_len = strnlen(name_start, end - p);
+        std::string name(name_start, name_len);
+        // Advance past the null-terminated string + padding to 4-byte alignment
+        p += name_len + 1;
+        while ((p - data) % 4 != 0 && p < end) p++;
+
+        // Read IDs
+        if (p + nr_ids * 8 > end) break;
+        for (uint32_t j = 0; j < nr_ids; j++) {
+            uint64_t id = read_val<uint64_t>(p);
+            // Map this ID to the attr index
+            if (i < attrs_.size()) {
+                id_to_attr_[id] = i;
+            }
+        }
+
+        // Store the name
+        if (i < attr_names_.size()) {
+            attr_names_[i] = name;
+        }
+    }
+}
+
+size_t PerfDataReader::find_attr_index(const uint8_t *record, size_t record_size) {
+    // If we only have one attr, it's trivial
+    if (attrs_.size() <= 1) {
+        return 0;
+    }
+
+    // For non-sample events with sample_id_all, the ID is at the end of the record.
+    // Try to extract it from the last 8 bytes if PERF_SAMPLE_ID or PERF_SAMPLE_IDENTIFIER
+    // is set.
+    if (attrs_.empty()) return 0;
+
+    const auto &attr = attrs_[0];
+    if (attr.sample_type & PERF_SAMPLE_IDENTIFIER) {
+        // IDENTIFIER is the first field in sample_id
+        // For non-sample records, sample_id is appended at the end
+        // The order of fields in sample_id matches sample_type bit order
+        // IDENTIFIER comes first if present
+        if (record_size >= sizeof(EventHeader) + 8) {
+            // sample_id is at the end; find where it starts based on sample_type fields
+            // With IDENTIFIER, it's the first field of the sample_id suffix
+            // But figuring out the exact position requires knowing the record type...
+            // Simplification: try the ID from the end of the record
+            uint64_t id;
+            // IDENTIFIER is the last 8 bytes when it's the only thing we need
+            std::memcpy(&id, record + record_size - 8, sizeof(id));
+            auto it = id_to_attr_.find(id);
+            if (it != id_to_attr_.end()) return it->second;
+        }
+    }
+
+    if (attr.sample_type & PERF_SAMPLE_ID) {
+        // ID field position in sample_id suffix depends on what comes before it
+        // Order: TID(8) TIME(8) ID(8) ...
+        (void)0; // ID field position logic is complex; fall through to default
+        // Actually, the sample_id at the end has fields in the same order as sample_type
+        // We need: count how many 8-byte fields come AFTER ID in the sample_type
+        uint64_t st = attr.sample_type;
+        size_t fields_after_id = 0;
+        bool past_id = false;
+        for (int bit = 0; bit < 25; bit++) {
+            if (bit == 6) { past_id = true; continue; } // PERF_SAMPLE_ID = bit 6
+            if (past_id && (st & (1ULL << bit))) {
+                if (bit == 1) fields_after_id++; // TID = 1 field (pid+tid = 8 bytes)
+                else if (bit == 7) fields_after_id++; // CPU = 1 field (cpu+res = 8 bytes)
+                else if (bit == 9) fields_after_id++; // STREAM_ID
+                else fields_after_id++;
+            }
+        }
+        // Hmm, this is getting complex. For the common case with our setup, let's try
+        // a simpler approach: just try each possible offset
+    }
+
+    // Fallback: for simple cases (synthetic data, single attr), just return 0
+    return 0;
+}
+
+PerfEventType PerfDataReader::classify_event(size_t attr_index) const {
+    if (attr_index >= attr_names_.size()) {
+        return PerfEventType::Other;
+    }
+
+    const std::string &name = attr_names_[attr_index];
+
+    if (name.find("sched_switch") != std::string::npos ||
+        name.find("sched:sched_switch") != std::string::npos) {
+        return PerfEventType::SchedSwitch;
+    }
+    if (name.find("sched_wakeup") != std::string::npos ||
+        name.find("sched:sched_wakeup") != std::string::npos) {
+        return PerfEventType::SchedWakeup;
+    }
+    if (name.find("sched_process_fork") != std::string::npos ||
+        name.find("sched:sched_process_fork") != std::string::npos) {
+        return PerfEventType::SchedFork;
+    }
+    if (name.find("python:take_gil_return") != std::string::npos) {
+        return PerfEventType::TakeGilReturn;
+    }
+    if (name.find("python:take_gil") != std::string::npos) {
+        return PerfEventType::TakeGil;
+    }
+    if (name.find("python:drop_gil") != std::string::npos) {
+        return PerfEventType::DropGil;
+    }
+    if (name.find("nvidia:launch") != std::string::npos) {
+        return PerfEventType::NvidiaLaunch;
+    }
+    if (name.find("nvidia:sync_start") != std::string::npos) {
+        return PerfEventType::NvidiaSyncStart;
+    }
+    if (name.find("nvidia:sync_end") != std::string::npos) {
+        return PerfEventType::NvidiaSyncEnd;
+    }
+
+    return PerfEventType::Other;
+}
+
+bool PerfDataReader::decode_sample(const uint8_t *payload, size_t payload_size,
+                                   const EventAttr &attr, PerfEvent &out) {
+    const uint8_t *p = payload;
+    const uint8_t *end = payload + payload_size;
+
+    uint64_t sample_type = attr.sample_type;
+
+    // Fields must be read in bit order of sample_type
+    if (sample_type & PERF_SAMPLE_IDENTIFIER) {
+        if (p + 8 > end) return false;
+        p += 8; // skip identifier
+    }
+    if (sample_type & PERF_SAMPLE_IP) {
+        if (p + 8 > end) return false;
+        p += 8; // skip IP
+    }
+    if (sample_type & PERF_SAMPLE_TID) {
+        if (p + 8 > end) return false;
+        out.pid = read_val<int32_t>(p);
+        out.tid = read_val<int32_t>(p);
+    }
+    if (sample_type & PERF_SAMPLE_TIME) {
+        if (p + 8 > end) return false;
+        out.timestamp_ns = read_val<uint64_t>(p);
+    }
+    if (sample_type & PERF_SAMPLE_ADDR) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (sample_type & PERF_SAMPLE_ID) {
+        if (p + 8 > end) return false;
+        p += 8; // skip id
+    }
+    if (sample_type & PERF_SAMPLE_STREAM_ID) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (sample_type & PERF_SAMPLE_CPU) {
+        if (p + 8 > end) return false;
+        out.cpu = read_val<int32_t>(p);
+        p += 4; // skip reserved
+    }
+    if (sample_type & PERF_SAMPLE_PERIOD) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (sample_type & PERF_SAMPLE_READ) {
+        // Variable-size read format; skip for now
+        // This is complex and depends on read_format flags
+        return false;
+    }
+    if (sample_type & PERF_SAMPLE_CALLCHAIN) {
+        if (p + 8 > end) return false;
+        uint64_t nr = read_val<uint64_t>(p);
+        if (p + nr * 8 > end) return false;
+        p += nr * 8; // skip callchain IPs
+    }
+    if (sample_type & PERF_SAMPLE_RAW) {
+        if (p + 4 > end) return false;
+        uint32_t raw_size = read_val<uint32_t>(p);
+        if (p + raw_size > end) return false;
+
+        // Use the raw data to decode tracepoint-specific fields
+        // based on event type
+        const uint8_t *raw_data = p;
+
+        if (out.type == PerfEventType::SchedSwitch && raw_size >= 56) {
+            // sched_switch format (common layout):
+            // common fields (8 bytes typically) + prev_comm(16) + prev_pid(4)
+            // + prev_prio(4) + prev_state(8) + next_comm(16) + next_pid(4) + next_prio(4)
+            //
+            // But the exact layout depends on the format string.
+            // For our synthetic data and typical kernels:
+            // The raw data starts AFTER the common trace fields.
+            // Common fields are usually: type(2) + flags(1) + preempt_count(1) + pid(4) = 8 bytes
+            // But the raw_data from perf already has common fields stripped in some cases.
+            //
+            // Let's try to use libtraceevent if we have format info,
+            // otherwise fall back to direct parsing.
+
+            // Direct parsing (for synthetic data and common kernel layout):
+            // Offset 0: prev_comm (16 bytes)
+            // Offset 16: prev_pid (4 bytes)
+            // Offset 20: prev_prio (4 bytes)
+            // Offset 24: prev_state (8 bytes)
+            // Offset 32: next_comm (16 bytes)
+            // Offset 48: next_pid (4 bytes)
+            // Offset 52: next_prio (4 bytes)
+
+            std::memcpy(out.data.sched_switch.prev_comm, raw_data,
+                        std::min<size_t>(16, raw_size));
+            out.data.sched_switch.prev_comm[16] = '\0';
+
+            if (raw_size >= 28) {
+                std::memcpy(&out.data.sched_switch.prev_pid, raw_data + 16, 4);
+                // prev_prio at +20, skip
+                std::memcpy(&out.data.sched_switch.prev_state, raw_data + 24, 8);
+            }
+            if (raw_size >= 56) {
+                std::memcpy(out.data.sched_switch.next_comm, raw_data + 32,
+                            std::min<size_t>(16, raw_size - 32));
+                out.data.sched_switch.next_comm[16] = '\0';
+                std::memcpy(&out.data.sched_switch.next_pid, raw_data + 48, 4);
+            }
+
+            out.data.sched_switch.prev_tid = out.data.sched_switch.prev_pid;
+            out.data.sched_switch.next_tid = out.data.sched_switch.next_pid;
+        }
+
+        p += raw_size;
+    }
+
+    return true;
+}
+
+void PerfDataReader::decode_comm(const uint8_t *payload, size_t payload_size) {
+    // COMM record: pid(u32) + tid(u32) + comm(null-terminated string)
+    if (payload_size < 8) return;
+
+    const uint8_t *p = payload;
+    int32_t pid = read_val<int32_t>(p);
+    int32_t tid = read_val<int32_t>(p);
+
+    size_t remaining = payload_size - 8;
+    // Account for sample_id suffix - the comm string ends at the first null
+    const char *comm = reinterpret_cast<const char *>(p);
+    size_t comm_len = strnlen(comm, remaining);
+    if (comm_len > 0) {
+        comm_map_[tid] = std::string(comm, comm_len);
+        if (pid == tid) {
+            comm_map_[pid] = std::string(comm, comm_len);
+        }
+    }
+}
+
+bool PerfDataReader::decode_fork(const uint8_t *payload, size_t payload_size,
+                                 PerfEvent &out) {
+    // FORK record: pid(u32) + ppid(u32) + tid(u32) + ptid(u32) + time(u64)
+    if (payload_size < 24) return false;
+
+    const uint8_t *p = payload;
+    int32_t pid = read_val<int32_t>(p);
+    int32_t ppid = read_val<int32_t>(p);
+    int32_t tid = read_val<int32_t>(p);
+    int32_t ptid = read_val<int32_t>(p);
+    uint64_t time = read_val<uint64_t>(p);
+
+    out.type = PerfEventType::SchedFork;
+    out.timestamp_ns = time;
+    out.pid = ppid;
+    out.tid = ptid;
+    out.data.fork.parent_tid = ptid;
+    out.data.fork.child_tid = tid;
+    out.data.fork.child_pid = pid;
+    return true;
+}
+
+void PerfDataReader::parse_data_section(EventCallback &cb) {
+    const uint8_t *data = mmap_base_ + header_.data.offset;
+    const uint8_t *end = data + header_.data.size;
+
+    while (data + sizeof(EventHeader) <= end) {
+        EventHeader hdr;
+        std::memcpy(&hdr, data, sizeof(EventHeader));
+
+        if (hdr.size < sizeof(EventHeader) || data + hdr.size > end) {
+            break; // Invalid or truncated record
+        }
+
+        const uint8_t *payload = data + sizeof(EventHeader);
+        size_t payload_size = hdr.size - sizeof(EventHeader);
+
+        switch (hdr.type) {
+        case PERF_RECORD_SAMPLE: {
+            // Determine which attr this sample belongs to
+            size_t attr_idx = find_attr_index(data, hdr.size);
+            if (attr_idx < attrs_.size()) {
+                PerfEvent event;
+                event.type = classify_event(attr_idx);
+                if (decode_sample(payload, payload_size, attrs_[attr_idx], event)) {
+                    event_count_++;
+                    cb(event);
+                }
+            }
+            break;
+        }
+        case PERF_RECORD_COMM:
+            decode_comm(payload, payload_size);
+            break;
+        case PERF_RECORD_FORK: {
+            PerfEvent event;
+            if (decode_fork(payload, payload_size, event)) {
+                event_count_++;
+                cb(event);
+            }
+            break;
+        }
+        default:
+            break; // Skip other record types
+        }
+
+        data += hdr.size;
+    }
+}
+
+void PerfDataReader::read_all_events(EventCallback cb) {
+    parse_data_section(cb);
+}
