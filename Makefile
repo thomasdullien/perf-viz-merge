@@ -26,7 +26,29 @@ OBJS := $(SRCS:.cpp=.o)
 DEPS := $(OBJS:.o=.d)
 TARGET := perf-viz-merge
 
-.PHONY: all clean test
+# Static build support
+# Downloads simdjson and fmt sources, compiles everything into a single static binary.
+STATIC_TARGET := perf-viz-merge-static
+VENDOR_DIR    := vendor
+
+# Static libs available on the system
+STATIC_LIBS := /usr/lib/x86_64-linux-gnu/libtraceevent.a \
+               /usr/lib/x86_64-linux-gnu/libelf.a \
+               /usr/lib/x86_64-linux-gnu/libdw.a \
+               /usr/lib/x86_64-linux-gnu/libz.a \
+               /usr/lib/x86_64-linux-gnu/liblzma.a \
+               /usr/lib/x86_64-linux-gnu/libbz2.a \
+               /usr/lib/x86_64-linux-gnu/libzstd.a
+
+STATIC_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -march=native \
+                   -I$(VENDOR_DIR)/simdjson -I$(VENDOR_DIR)/fmt/include \
+                   -I/usr/include/traceevent \
+                   -DSIMDJSON_THREADS_ENABLED=1 -DFMT_HEADER_ONLY=1
+STATIC_LDFLAGS  := -static -lpthread
+
+STATIC_OBJS := $(SRCS:src/%.cpp=build-static/%.o) build-static/simdjson.o
+
+.PHONY: all clean test static
 
 all: $(TARGET)
 
@@ -36,11 +58,46 @@ $(TARGET): $(OBJS)
 src/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
 
+# --- Static target ---
+static: $(STATIC_TARGET)
+
+$(VENDOR_DIR)/simdjson/simdjson.h $(VENDOR_DIR)/simdjson/simdjson.cpp:
+	@mkdir -p $(VENDOR_DIR)/simdjson
+	@echo "Downloading simdjson amalgamated source..."
+	curl -sL https://raw.githubusercontent.com/simdjson/simdjson/master/singleheader/simdjson.h \
+		-o $(VENDOR_DIR)/simdjson/simdjson.h
+	curl -sL https://raw.githubusercontent.com/simdjson/simdjson/master/singleheader/simdjson.cpp \
+		-o $(VENDOR_DIR)/simdjson/simdjson.cpp
+
+$(VENDOR_DIR)/fmt/include/fmt/format.h:
+	@mkdir -p $(VENDOR_DIR)
+	@echo "Downloading fmt..."
+	@if [ ! -d $(VENDOR_DIR)/fmt ]; then \
+		git clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git $(VENDOR_DIR)/fmt; \
+	fi
+
+build-static/%.o: src/%.cpp $(VENDOR_DIR)/simdjson/simdjson.h $(VENDOR_DIR)/fmt/include/fmt/format.h
+	@mkdir -p build-static
+	$(CXX) $(STATIC_CXXFLAGS) -MMD -MP -c -o $@ $<
+
+build-static/simdjson.o: $(VENDOR_DIR)/simdjson/simdjson.cpp $(VENDOR_DIR)/simdjson/simdjson.h
+	@mkdir -p build-static
+	$(CXX) $(STATIC_CXXFLAGS) -MMD -MP -c -o $@ $<
+
+$(STATIC_TARGET): $(STATIC_OBJS)
+	$(CXX) $(STATIC_CXXFLAGS) -o $@ $^ $(STATIC_LIBS) $(STATIC_LDFLAGS)
+	@echo "Static binary built: $(STATIC_TARGET) ($$(du -h $(STATIC_TARGET) | cut -f1))"
+	@echo "Verify: ldd $(STATIC_TARGET) should say 'not a dynamic executable'"
+
 clean:
-	rm -f $(OBJS) $(DEPS) $(TARGET)
-	rm -rf test/output
+	rm -f $(OBJS) $(DEPS) $(TARGET) $(STATIC_TARGET)
+	rm -rf test/output build-static
+
+distclean: clean
+	rm -rf $(VENDOR_DIR)
 
 test: $(TARGET)
 	./test/verify.sh --synthetic
 
 -include $(DEPS)
+-include $(wildcard build-static/*.d)

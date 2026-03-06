@@ -2,6 +2,11 @@
 *.o
 *.d
 perf-viz-merge
+perf-viz-merge-static
+build-static/
+
+# Vendored sources (downloaded by `make static`)
+vendor/
 
 # Test output
 test/output/
