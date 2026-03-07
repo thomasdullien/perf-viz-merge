@@ -322,6 +322,7 @@ def generate_synthetic_perf_data(output_dir):
     event_desc = struct.pack('<II', 1, ATTR_SIZE)  # nr_events=1, attr_size
     event_desc += bytes(attr)                       # the attr
     event_desc += struct.pack('<I', 0)              # nr_ids=0
+    event_desc += struct.pack('<I', len(event_name))  # str_size
     event_desc += event_name                        # event name
 
     # Build the file

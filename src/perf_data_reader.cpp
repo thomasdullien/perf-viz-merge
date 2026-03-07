@@ -222,26 +222,26 @@ void PerfDataReader::parse_event_desc_section(const uint8_t *data, size_t size) 
     uint32_t attr_size = read_val<uint32_t>(p);
 
     for (uint32_t i = 0; i < nr_events && p < end; i++) {
-        // Skip the attr (we already have it)
+        // Skip the attr
         if (p + attr_size > end) break;
         p += attr_size;
 
         if (p + 4 > end) break;
         uint32_t nr_ids = read_val<uint32_t>(p);
 
-        // Read null-terminated event name
+        // Read event name: u32 str_size followed by str_size bytes (null-padded)
+        if (p + 4 > end) break;
+        uint32_t str_size = read_val<uint32_t>(p);
+        if (p + str_size > end) break;
         const char *name_start = reinterpret_cast<const char *>(p);
-        size_t name_len = strnlen(name_start, end - p);
+        size_t name_len = strnlen(name_start, str_size);
         std::string name(name_start, name_len);
-        // Advance past the null-terminated string + padding to 4-byte alignment
-        p += name_len + 1;
-        while ((p - data) % 4 != 0 && p < end) p++;
+        p += str_size;
 
         // Read IDs
         if (p + nr_ids * 8 > end) break;
         for (uint32_t j = 0; j < nr_ids; j++) {
             uint64_t id = read_val<uint64_t>(p);
-            // Map this ID to the attr index
             if (i < attrs_.size()) {
                 id_to_attr_[id] = i;
             }
@@ -255,58 +255,41 @@ void PerfDataReader::parse_event_desc_section(const uint8_t *data, size_t size) 
 }
 
 size_t PerfDataReader::find_attr_index(const uint8_t *record, size_t record_size) {
-    // If we only have one attr, it's trivial
     if (attrs_.size() <= 1) {
         return 0;
     }
-
-    // For non-sample events with sample_id_all, the ID is at the end of the record.
-    // Try to extract it from the last 8 bytes if PERF_SAMPLE_ID or PERF_SAMPLE_IDENTIFIER
-    // is set.
     if (attrs_.empty()) return 0;
 
+    // For PERF_RECORD_SAMPLE, extract the ID by parsing fields in the order
+    // defined by the perf ABI (perf_event_open(2) man page):
+    //   IDENTIFIER, IP, TID, TIME, ADDR, ID, STREAM_ID, CPU, PERIOD,
+    //   READ, CALLCHAIN, BRANCH_STACK, ...
+    // Note: this is NOT strict bit order!
     const auto &attr = attrs_[0];
-    if (attr.sample_type & PERF_SAMPLE_IDENTIFIER) {
-        // IDENTIFIER is the first field in sample_id
-        // For non-sample records, sample_id is appended at the end
-        // The order of fields in sample_id matches sample_type bit order
-        // IDENTIFIER comes first if present
-        if (record_size >= sizeof(EventHeader) + 8) {
-            // sample_id is at the end; find where it starts based on sample_type fields
-            // With IDENTIFIER, it's the first field of the sample_id suffix
-            // But figuring out the exact position requires knowing the record type...
-            // Simplification: try the ID from the end of the record
-            uint64_t id;
-            // IDENTIFIER is the last 8 bytes when it's the only thing we need
-            std::memcpy(&id, record + record_size - 8, sizeof(id));
-            auto it = id_to_attr_.find(id);
-            if (it != id_to_attr_.end()) return it->second;
-        }
+    const uint8_t *p = record + sizeof(EventHeader);
+    const uint8_t *end = record + record_size;
+    uint64_t st = attr.sample_type;
+
+    if (st & PERF_SAMPLE_IDENTIFIER) {
+        if (p + 8 > end) return 0;
+        uint64_t id;
+        std::memcpy(&id, p, 8);
+        auto it = id_to_attr_.find(id);
+        if (it != id_to_attr_.end()) return it->second;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_IP)   { if (p + 8 > end) return 0; p += 8; }
+    if (st & PERF_SAMPLE_TID)  { if (p + 8 > end) return 0; p += 8; }
+    if (st & PERF_SAMPLE_TIME) { if (p + 8 > end) return 0; p += 8; }
+    if (st & PERF_SAMPLE_ADDR) { if (p + 8 > end) return 0; p += 8; }
+    if (st & PERF_SAMPLE_ID) {
+        if (p + 8 > end) return 0;
+        uint64_t id;
+        std::memcpy(&id, p, 8);
+        auto it = id_to_attr_.find(id);
+        if (it != id_to_attr_.end()) return it->second;
     }
 
-    if (attr.sample_type & PERF_SAMPLE_ID) {
-        // ID field position in sample_id suffix depends on what comes before it
-        // Order: TID(8) TIME(8) ID(8) ...
-        (void)0; // ID field position logic is complex; fall through to default
-        // Actually, the sample_id at the end has fields in the same order as sample_type
-        // We need: count how many 8-byte fields come AFTER ID in the sample_type
-        uint64_t st = attr.sample_type;
-        size_t fields_after_id = 0;
-        bool past_id = false;
-        for (int bit = 0; bit < 25; bit++) {
-            if (bit == 6) { past_id = true; continue; } // PERF_SAMPLE_ID = bit 6
-            if (past_id && (st & (1ULL << bit))) {
-                if (bit == 1) fields_after_id++; // TID = 1 field (pid+tid = 8 bytes)
-                else if (bit == 7) fields_after_id++; // CPU = 1 field (cpu+res = 8 bytes)
-                else if (bit == 9) fields_after_id++; // STREAM_ID
-                else fields_after_id++;
-            }
-        }
-        // Hmm, this is getting complex. For the common case with our setup, let's try
-        // a simpler approach: just try each possible offset
-    }
-
-    // Fallback: for simple cases (synthetic data, single attr), just return 0
     return 0;
 }
 
@@ -329,13 +312,17 @@ PerfEventType PerfDataReader::classify_event(size_t attr_index) const {
         name.find("sched:sched_process_fork") != std::string::npos) {
         return PerfEventType::SchedFork;
     }
-    if (name.find("python:take_gil_return") != std::string::npos) {
+    // GIL probes — check more specific names first
+    // perf may name return probes as "take_gil_return" or "take_gil_return__return"
+    if (name.find("take_gil_return") != std::string::npos ||
+        name.find("take_gil_ret") != std::string::npos ||
+        name.find("take_gil__return") != std::string::npos) {
         return PerfEventType::TakeGilReturn;
     }
-    if (name.find("python:take_gil") != std::string::npos) {
+    if (name.find("take_gil") != std::string::npos) {
         return PerfEventType::TakeGil;
     }
-    if (name.find("python:drop_gil") != std::string::npos) {
+    if (name.find("drop_gil") != std::string::npos) {
         return PerfEventType::DropGil;
     }
     // NVIDIA CUDA probes — order matters: check more specific names first
@@ -439,59 +426,124 @@ bool PerfDataReader::decode_sample(const uint8_t *payload, size_t payload_size,
     const uint8_t *p = payload;
     const uint8_t *end = payload + payload_size;
 
-    uint64_t sample_type = attr.sample_type;
+    uint64_t st = attr.sample_type;
 
-    // Fields must be read in bit order of sample_type
-    if (sample_type & PERF_SAMPLE_IDENTIFIER) {
+    // Fields are in the order defined by the perf ABI (perf_event_open(2)):
+    //   IDENTIFIER, IP, TID, TIME, ADDR, ID, STREAM_ID, CPU, PERIOD,
+    //   READ, CALLCHAIN, BRANCH_STACK, REGS_USER, STACK_USER,
+    //   WEIGHT/WEIGHT_STRUCT, DATA_SRC, TRANSACTION, REGS_INTR,
+    //   PHYS_ADDR, CGROUP, DATA_PAGE_SIZE, CODE_PAGE_SIZE, AUX, RAW
+    // Note: this is NOT bit order!
+
+    if (st & PERF_SAMPLE_IDENTIFIER) {
         if (p + 8 > end) return false;
-        p += 8; // skip identifier
+        p += 8;
     }
-    if (sample_type & PERF_SAMPLE_IP) {
+    if (st & PERF_SAMPLE_IP) {
         if (p + 8 > end) return false;
-        p += 8; // skip IP
+        p += 8;
     }
-    if (sample_type & PERF_SAMPLE_TID) {
+    if (st & PERF_SAMPLE_TID) {
         if (p + 8 > end) return false;
         out.pid = read_val<int32_t>(p);
         out.tid = read_val<int32_t>(p);
     }
-    if (sample_type & PERF_SAMPLE_TIME) {
+    if (st & PERF_SAMPLE_TIME) {
         if (p + 8 > end) return false;
         out.timestamp_ns = read_val<uint64_t>(p);
     }
-    if (sample_type & PERF_SAMPLE_ADDR) {
+    if (st & PERF_SAMPLE_ADDR) {
         if (p + 8 > end) return false;
         p += 8;
     }
-    if (sample_type & PERF_SAMPLE_ID) {
-        if (p + 8 > end) return false;
-        p += 8; // skip id
-    }
-    if (sample_type & PERF_SAMPLE_STREAM_ID) {
+    if (st & PERF_SAMPLE_ID) {
         if (p + 8 > end) return false;
         p += 8;
     }
-    if (sample_type & PERF_SAMPLE_CPU) {
+    if (st & PERF_SAMPLE_STREAM_ID) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_CPU) {
         if (p + 8 > end) return false;
         out.cpu = read_val<int32_t>(p);
         p += 4; // skip reserved
     }
-    if (sample_type & PERF_SAMPLE_PERIOD) {
+    if (st & PERF_SAMPLE_PERIOD) {
         if (p + 8 > end) return false;
         p += 8;
     }
-    if (sample_type & PERF_SAMPLE_READ) {
-        // Variable-size read format; skip for now
-        // This is complex and depends on read_format flags
-        return false;
+    if (st & PERF_SAMPLE_READ) {
+        return false; // variable-size, too complex
     }
-    if (sample_type & PERF_SAMPLE_CALLCHAIN) {
+    if (st & PERF_SAMPLE_CALLCHAIN) {
         if (p + 8 > end) return false;
         uint64_t nr = read_val<uint64_t>(p);
-        if (p + nr * 8 > end) return false;
-        p += nr * 8; // skip callchain IPs
+        if (nr > 1024 || p + nr * 8 > end) return false; // sanity check
+        p += nr * 8;
     }
-    if (sample_type & PERF_SAMPLE_RAW) {
+    if (st & PERF_SAMPLE_BRANCH_STACK) {
+        if (p + 8 > end) return false;
+        uint64_t nr = read_val<uint64_t>(p);
+        // Each branch entry is 24 bytes (from, to, flags)
+        if (p + nr * 24 > end) return false;
+        p += nr * 24;
+    }
+    if (st & PERF_SAMPLE_REGS_USER) {
+        // Skip: u64 abi + regs based on sample_regs_user weight
+        // Too complex to parse generically; bail
+        return false;
+    }
+    if (st & PERF_SAMPLE_STACK_USER) {
+        if (p + 8 > end) return false;
+        uint64_t size = read_val<uint64_t>(p);
+        if (p + size > end) return false;
+        p += size;
+        if (size > 0) {
+            if (p + 8 > end) return false;
+            p += 8; // dyn_size
+        }
+    }
+    // WEIGHT (bit 14) or WEIGHT_STRUCT (bit 24) — both 8 bytes
+    if (st & (PERF_SAMPLE_WEIGHT | PERF_SAMPLE_WEIGHT_STRUCT)) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_DATA_SRC) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_TRANSACTION) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_REGS_INTR) {
+        return false; // variable, skip
+    }
+    if (st & PERF_SAMPLE_PHYS_ADDR) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_AUX) {
+        if (p + 8 > end) return false;
+        uint64_t size = read_val<uint64_t>(p);
+        if (p + size > end) return false;
+        p += size;
+    }
+    if (st & PERF_SAMPLE_CGROUP) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_DATA_PAGE_SIZE) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    if (st & PERF_SAMPLE_CODE_PAGE_SIZE) {
+        if (p + 8 > end) return false;
+        p += 8;
+    }
+    // RAW comes last
+    if (st & PERF_SAMPLE_RAW) {
         if (p + 4 > end) return false;
         uint32_t raw_size = read_val<uint32_t>(p);
         if (p + raw_size > end) return false;
@@ -500,43 +552,49 @@ bool PerfDataReader::decode_sample(const uint8_t *payload, size_t payload_size,
         // based on event type
         const uint8_t *raw_data = p;
 
-        if (out.type == PerfEventType::SchedSwitch && raw_size >= 56) {
-            // sched_switch format (common layout):
-            // common fields (8 bytes typically) + prev_comm(16) + prev_pid(4)
-            // + prev_prio(4) + prev_state(8) + next_comm(16) + next_pid(4) + next_prio(4)
+        if (out.type == PerfEventType::SchedSwitch) {
+            // Raw tracepoint data layout:
+            //   Common fields (8 bytes): type(2) + flags(1) + preempt_count(1) + pid(4)
+            //   sched_switch fields:
+            //     prev_comm: char[16]  (offset 8)
+            //     prev_pid:  i32       (offset 24)
+            //     prev_prio: i32       (offset 28)
+            //     prev_state: i64      (offset 32, kernel 6.x; i32 on older)
+            //     next_comm: char[16]  (offset 40)
+            //     next_pid:  i32       (offset 56)
+            //     next_prio: i32       (offset 60)
+            //   Total: 64 bytes
             //
-            // But the exact layout depends on the format string.
-            // For our synthetic data and typical kernels:
-            // The raw data starts AFTER the common trace fields.
-            // Common fields are usually: type(2) + flags(1) + preempt_count(1) + pid(4) = 8 bytes
-            // But the raw_data from perf already has common fields stripped in some cases.
-            //
-            // Let's try to use libtraceevent if we have format info,
-            // otherwise fall back to direct parsing.
+            // Some perf versions strip the common header; try both layouts.
 
-            // Direct parsing (for synthetic data and common kernel layout):
-            // Offset 0: prev_comm (16 bytes)
-            // Offset 16: prev_pid (4 bytes)
-            // Offset 20: prev_prio (4 bytes)
-            // Offset 24: prev_state (8 bytes)
-            // Offset 32: next_comm (16 bytes)
-            // Offset 48: next_pid (4 bytes)
-            // Offset 52: next_prio (4 bytes)
+            const size_t COMMON_SIZE = 8;
+            size_t base = 0;
 
-            std::memcpy(out.data.sched_switch.prev_comm, raw_data,
-                        std::min<size_t>(16, raw_size));
+            // Heuristic: if raw_size >= 64, common fields are likely included.
+            // If raw_size >= 56 but < 64, common fields may be stripped.
+            if (raw_size >= COMMON_SIZE + 56) {
+                base = COMMON_SIZE; // skip common fields
+            } else if (raw_size >= 56) {
+                base = 0; // no common fields
+            } else {
+                // Too small, skip
+                p += raw_size;
+                return true;
+            }
+
+            std::memcpy(out.data.sched_switch.prev_comm, raw_data + base,
+                        std::min<size_t>(16, raw_size - base));
             out.data.sched_switch.prev_comm[16] = '\0';
 
-            if (raw_size >= 28) {
-                std::memcpy(&out.data.sched_switch.prev_pid, raw_data + 16, 4);
-                // prev_prio at +20, skip
-                std::memcpy(&out.data.sched_switch.prev_state, raw_data + 24, 8);
+            if (base + 32 <= raw_size) {
+                std::memcpy(&out.data.sched_switch.prev_pid, raw_data + base + 16, 4);
+                std::memcpy(&out.data.sched_switch.prev_state, raw_data + base + 24, 8);
             }
-            if (raw_size >= 56) {
-                std::memcpy(out.data.sched_switch.next_comm, raw_data + 32,
-                            std::min<size_t>(16, raw_size - 32));
+            if (base + 56 <= raw_size) {
+                std::memcpy(out.data.sched_switch.next_comm, raw_data + base + 32,
+                            std::min<size_t>(16, raw_size - base - 32));
                 out.data.sched_switch.next_comm[16] = '\0';
-                std::memcpy(&out.data.sched_switch.next_pid, raw_data + 48, 4);
+                std::memcpy(&out.data.sched_switch.next_pid, raw_data + base + 48, 4);
             }
 
             out.data.sched_switch.prev_tid = out.data.sched_switch.prev_pid;
@@ -608,7 +666,6 @@ void PerfDataReader::parse_data_section(EventCallback &cb) {
 
         switch (hdr.type) {
         case PERF_RECORD_SAMPLE: {
-            // Determine which attr this sample belongs to
             size_t attr_idx = find_attr_index(data, hdr.size);
             if (attr_idx < attrs_.size()) {
                 PerfEvent event;
@@ -637,6 +694,7 @@ void PerfDataReader::parse_data_section(EventCallback &cb) {
 
         data += hdr.size;
     }
+
 }
 
 void PerfDataReader::read_all_events(EventCallback cb) {
