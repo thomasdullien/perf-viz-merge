@@ -61,6 +61,39 @@ void MergeEngine::add_perf_events(
     }
 }
 
+// Clean up VizTracer THREAD_MAP instant event names.
+// Input:  "THREAD_MAP: local_tid=476551 global_tid=476551 name='mcproc__0'"
+// Output: "476551 mcproc__0"  (if local==global)
+// Output: "476551/476551 mcproc__0"  (if local!=global, shouldn't happen)
+static std::string clean_thread_map_name(std::string_view name) {
+    // Parse: "THREAD_MAP: local_tid=N global_tid=M name='...'"
+    auto local_pos = name.find("local_tid=");
+    auto global_pos = name.find("global_tid=");
+    auto name_pos = name.find("name='");
+    if (local_pos == std::string_view::npos ||
+        global_pos == std::string_view::npos ||
+        name_pos == std::string_view::npos)
+        return std::string(name);
+
+    auto local_val = name.substr(local_pos + 10);
+    auto local_end = local_val.find(' ');
+    auto local_tid = local_val.substr(0, local_end);
+
+    auto global_val = name.substr(global_pos + 11);
+    auto global_end = global_val.find(' ');
+    auto global_tid = global_val.substr(0, global_end);
+
+    auto thread_name = name.substr(name_pos + 6);
+    auto quote_end = thread_name.find('\'');
+    if (quote_end != std::string_view::npos)
+        thread_name = thread_name.substr(0, quote_end);
+
+    if (local_tid == global_tid) {
+        return fmt::format("{} {}", local_tid, thread_name);
+    }
+    return fmt::format("{}/{} {}", local_tid, global_tid, thread_name);
+}
+
 static const char *prev_state_name(int64_t state) {
     switch (state & 0x0f) {
     case 0:  return "Running (preempted)";
@@ -571,7 +604,14 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
                 std::string_view cat = ve.cat.empty() ? "python" :
                     std::string_view(ve.cat);
 
-                writer_.write_viz_event(ve.ph, ve.name, cat,
+                std::string_view event_name = ve.name;
+                std::string cleaned_name;
+                if (event_name.substr(0, 11) == "THREAD_MAP:") {
+                    cleaned_name = clean_thread_map_name(event_name);
+                    event_name = cleaned_name;
+                }
+
+                writer_.write_viz_event(ve.ph, event_name, cat,
                                         ts, ve.dur_us, ve.pid, ve.tid, args);
                 viz_written_++;
             }
@@ -609,7 +649,14 @@ void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
             std::string_view cat = ve.cat.empty() ? "python" :
                 std::string_view(ve.cat);
 
-            writer_.write_viz_event(ve.ph, ve.name, cat,
+            std::string_view event_name = ve.name;
+            std::string cleaned_name;
+            if (event_name.substr(0, 11) == "THREAD_MAP:") {
+                cleaned_name = clean_thread_map_name(event_name);
+                event_name = cleaned_name;
+            }
+
+            writer_.write_viz_event(ve.ph, event_name, cat,
                                     ts, ve.dur_us, ve.pid, ve.tid, args);
             viz_written_++;
         }
