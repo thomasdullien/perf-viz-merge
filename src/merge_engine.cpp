@@ -2,13 +2,45 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 #include <fmt/format.h>
 
-MergeEngine::MergeEngine(TraceWriter &writer, ClockAligner &aligner, Options opts)
+MergeEngine::MergeEngine(OutputWriter &writer, ClockAligner &aligner, Options opts)
     : writer_(writer), aligner_(aligner), opts_(std::move(opts)) {}
 
 bool MergeEngine::passes_filter(int32_t pid) const {
     return opts_.filter_pid < 0 || pid == opts_.filter_pid;
+}
+
+int32_t MergeEngine::tgid_for(int32_t tid) const {
+    auto it = tid_to_tgid_.find(tid);
+    return it != tid_to_tgid_.end() ? it->second : tid;
+}
+
+void MergeEngine::build_tid_map(const std::vector<VizEvent> &viz_events) {
+    // From perf fork events: child_tid belongs to child_pid (which IS the tgid)
+    for (const auto &event : perf_events_) {
+        if (event.type == PerfEventType::SchedFork) {
+            int32_t child_pid = event.data.fork.child_pid;
+            int32_t child_tid = event.data.fork.child_tid;
+            if (child_pid > 0 && child_tid > 0) {
+                tid_to_tgid_[child_tid] = child_pid;
+            }
+        }
+        // The perf event header pid is the real TGID
+        if (event.pid > 0 && event.tid > 0) {
+            tid_to_tgid_[event.tid] = event.pid;
+        }
+    }
+    // From VizTracer: pid is always the real process PID
+    for (const auto &ve : viz_events) {
+        if (ve.pid > 0 && ve.tid > 0) {
+            tid_to_tgid_[static_cast<int32_t>(ve.tid)] = static_cast<int32_t>(ve.pid);
+        }
+    }
+    if (opts_.verbose) {
+        fmt::print(stderr, "Built TID->TGID map with {} entries\n", tid_to_tgid_.size());
+    }
 }
 
 void MergeEngine::add_perf_events(
@@ -29,10 +61,75 @@ void MergeEngine::add_perf_events(
     }
 }
 
+static const char *prev_state_name(int64_t state) {
+    switch (state & 0x0f) {
+    case 0:  return "Running (preempted)";
+    case 1:  return "Sleeping (interruptible)";
+    case 2:  return "Disk sleep (uninterruptible)";
+    case 4:  return "Stopped";
+    case 8:  return "Traced";
+    default: return "Unknown";
+    }
+}
+
 void MergeEngine::write_metadata() {
+    // Collect unique PIDs and their process names
+    std::unordered_map<int32_t, std::string> pid_names;
+    // Track which TIDs we've seen for GIL/sched synthetic track metadata
+    std::unordered_set<int32_t> seen_tids;
+
     for (const auto &[tid, name] : comm_map_) {
+        int32_t tgid = tgid_for(tid);
         std::string args = fmt::format(R"({{"name":"{}"}})", name);
-        writer_.write_metadata("thread_name", tid, tid, args);
+        writer_.write_metadata("thread_name", tgid, tid, args);
+        seen_tids.insert(tid);
+
+        // Track process names by TGID
+        if (pid_names.find(tgid) == pid_names.end()) {
+            pid_names[tgid] = name;
+        }
+    }
+    // Also derive process names from perf events
+    for (const auto &event : perf_events_) {
+        if (event.pid > 0 && pid_names.find(event.pid) == pid_names.end()) {
+            auto it = comm_map_.find(event.pid);
+            if (it != comm_map_.end()) {
+                pid_names[event.pid] = it->second;
+            }
+        }
+    }
+    for (const auto &[pid, name] : pid_names) {
+        std::string args = fmt::format(R"({{"name":"{}"}})", name);
+        writer_.write_metadata("process_name", pid, 0, args);
+    }
+
+    // Emit metadata for synthetic GIL and sched tracks, with sort order:
+    // sort_index 0 = sched track, 1 = GIL track, 2 = call stacks (default)
+    for (int32_t tid : seen_tids) {
+        auto comm_it = comm_map_.find(tid);
+        std::string base = comm_it != comm_map_.end() ? comm_it->second : std::to_string(tid);
+        int32_t tgid = tgid_for(tid);
+
+        // Sort index for the real thread (call stacks)
+        writer_.write_metadata("thread_sort_index", tgid, tid,
+                               R"({"sort_index":2})");
+
+        if (opts_.include_sched) {
+            int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
+            std::string sched_name = fmt::format("{} [sched]", base);
+            std::string args = fmt::format(R"({{"name":"{}"}})", sched_name);
+            writer_.write_metadata("thread_name", tgid, sched_tid, args);
+            writer_.write_metadata("thread_sort_index", tgid, sched_tid,
+                                   R"({"sort_index":0})");
+        }
+        if (opts_.include_gil) {
+            int64_t gil_tid = static_cast<int64_t>(tid) + GIL_TID_OFFSET;
+            std::string gil_name = fmt::format("{} [GIL]", base);
+            std::string args = fmt::format(R"({{"name":"{}"}})", gil_name);
+            writer_.write_metadata("thread_name", tgid, gil_tid, args);
+            writer_.write_metadata("thread_sort_index", tgid, gil_tid,
+                                   R"({"sort_index":1})");
+        }
     }
 }
 
@@ -45,80 +142,93 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
         int32_t prev_tid = event.data.sched_switch.prev_tid;
         int32_t next_tid = event.data.sched_switch.next_tid;
+        // Use TGID map — kernel sched_switch "pid" is actually TID
+        int32_t prev_tgid = tgid_for(prev_tid);
+        int32_t next_tgid = tgid_for(next_tid);
+        int64_t sched_prev_tid = static_cast<int64_t>(prev_tid) + SCHED_TID_OFFSET;
+        int64_t sched_next_tid = static_cast<int64_t>(next_tid) + SCHED_TID_OFFSET;
 
-        if (passes_filter(event.data.sched_switch.prev_pid) ||
-            passes_filter(event.data.sched_switch.next_pid)) {
-
-            // Emit "on-cpu" duration event for prev_tid if we have its switch-in time
-            auto it = sched_switch_in_.find(prev_tid);
-            if (it != sched_switch_in_.end()) {
-                double start_us = aligner_.align_perf(it->second);
+        // prev_tid is being switched OUT
+        if (passes_filter(prev_tgid)) {
+            auto it = sched_state_.find(prev_tid);
+            if (it != sched_state_.end() && it->second.on_cpu) {
+                // Close on-CPU span: from last_event_ns to now
+                double start_us = aligner_.align_perf(it->second.last_event_ns);
                 double dur_us = ts_us - start_us;
-                if (dur_us > 0 && passes_filter(event.data.sched_switch.prev_pid)) {
+                if (dur_us > 0) {
                     std::string args = fmt::format(
-                        R"({{"cpu":{},"prev_state":{}}})",
-                        event.cpu, event.data.sched_switch.prev_state);
-
-                    std::string name = "on-cpu";
-                    auto comm_it = comm_map_.find(prev_tid);
-                    if (comm_it != comm_map_.end()) {
-                        name = comm_it->second + " [on-cpu]";
-                    }
-
+                        R"({{"cpu":{}}})", it->second.last_cpu);
                     writer_.write_complete(
-                        name, "sched", start_us, dur_us,
-                        event.data.sched_switch.prev_pid, prev_tid, args);
+                        "on-cpu", "sched", start_us, dur_us,
+                        prev_tgid, sched_prev_tid, args);
                     perf_written_++;
                 }
-                sched_switch_in_.erase(it);
             }
+            // Update state: now off-cpu
+            sched_state_[prev_tid] = {
+                event.timestamp_ns,
+                false,
+                event.data.sched_switch.prev_state,
+                event.cpu
+            };
+        }
 
-            // Always emit the raw sched_switch as an instant event
-            {
-                std::string prev_comm(event.data.sched_switch.prev_comm);
-                std::string next_comm(event.data.sched_switch.next_comm);
-                std::string args = fmt::format(
-                    R"({{"prev_comm":"{}","prev_tid":{},"prev_state":{},"next_comm":"{}","next_tid":{},"cpu":{}}})",
-                    prev_comm, prev_tid, event.data.sched_switch.prev_state,
-                    next_comm, next_tid, event.cpu);
-
-                std::string name = fmt::format("sched_switch: {} -> {}",
-                                               prev_comm, next_comm);
-
-                writer_.write_instant(name, "sched", ts_us,
-                                      event.pid, event.tid, "t", args);
-                perf_written_++;
+        // next_tid is being switched IN
+        if (passes_filter(next_tgid)) {
+            auto it = sched_state_.find(next_tid);
+            if (it != sched_state_.end() && !it->second.on_cpu) {
+                // Close off-CPU span: from last_event_ns to now
+                double start_us = aligner_.align_perf(it->second.last_event_ns);
+                double dur_us = ts_us - start_us;
+                if (dur_us > 0) {
+                    std::string args = fmt::format(
+                        R"({{"reason":"{}"}})",
+                        prev_state_name(it->second.off_cpu_reason));
+                    writer_.write_complete(
+                        prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                        start_us, dur_us,
+                        next_tgid, sched_next_tid, args);
+                    perf_written_++;
+                }
             }
-
-            // Record that next_tid is now on-cpu
-            sched_switch_in_[next_tid] = event.timestamp_ns;
+            // Update state: now on-cpu
+            sched_state_[next_tid] = {
+                event.timestamp_ns,
+                true,
+                0,
+                event.cpu
+            };
         }
         break;
     }
 
     case PerfEventType::SchedWakeup: {
         if (!opts_.include_sched) return;
-        if (!passes_filter(event.data.wakeup.target_pid)) return;
+        int32_t target_tgid = tgid_for(event.data.wakeup.target_tid);
+        if (!passes_filter(target_tgid)) return;
 
+        int64_t sched_tid = static_cast<int64_t>(event.data.wakeup.target_tid) + SCHED_TID_OFFSET;
         std::string args = fmt::format(
             R"({{"target_tid":{}}})", event.data.wakeup.target_tid);
 
         writer_.write_instant("sched_wakeup", "sched", ts_us,
-                              event.pid, event.tid, "t", args);
+                              target_tgid, sched_tid, "t", args);
         perf_written_++;
         break;
     }
 
     case PerfEventType::SchedFork: {
         if (!opts_.include_sched) return;
-        if (!passes_filter(event.pid)) return;
+        int32_t tgid = tgid_for(event.tid);
+        if (!passes_filter(tgid)) return;
 
+        int64_t sched_tid = static_cast<int64_t>(event.tid) + SCHED_TID_OFFSET;
         std::string args = fmt::format(
             R"({{"child_pid":{},"child_tid":{}}})",
             event.data.fork.child_pid, event.data.fork.child_tid);
 
         writer_.write_instant("process_fork", "sched", ts_us,
-                              event.pid, event.tid, "t", args);
+                              tgid, sched_tid, "t", args);
         perf_written_++;
         break;
     }
@@ -127,9 +237,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid)) return;
 
+        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         gil_start_[event.tid] = event.timestamp_ns;
         writer_.write_begin("GIL acquire", "gil", ts_us,
-                            event.pid, event.tid);
+                            event.pid, gil_tid);
         perf_written_++;
         break;
     }
@@ -138,19 +249,19 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid)) return;
 
+        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         auto it = gil_start_.find(event.tid);
         if (it != gil_start_.end()) {
-            // We already emitted B, so just emit E
             writer_.write_end("GIL acquire", "gil", ts_us,
-                              event.pid, event.tid);
+                              event.pid, gil_tid);
             perf_written_++;
             gil_start_.erase(it);
-        } else {
-            // No matching take_gil, emit as instant
-            writer_.write_instant("GIL acquired", "gil", ts_us,
-                                  event.pid, event.tid);
-            perf_written_++;
         }
+        // Start a "GIL held" span — closed by drop_gil
+        gil_held_[event.tid] = event.timestamp_ns;
+        writer_.write_begin("GIL held", "gil", ts_us,
+                            event.pid, gil_tid);
+        perf_written_++;
         break;
     }
 
@@ -158,9 +269,14 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid)) return;
 
-        writer_.write_instant("GIL release", "gil", ts_us,
-                              event.pid, event.tid);
-        perf_written_++;
+        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
+        auto it = gil_held_.find(event.tid);
+        if (it != gil_held_.end()) {
+            writer_.write_end("GIL held", "gil", ts_us,
+                              event.pid, gil_tid);
+            perf_written_++;
+            gil_held_.erase(it);
+        }
         break;
     }
 
@@ -383,7 +499,45 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     }
 }
 
+void MergeEngine::flush_sched_state() {
+    if (!opts_.include_sched) return;
+
+    // Find the last perf event timestamp to close open spans
+    uint64_t last_ts_ns = 0;
+    if (!perf_events_.empty()) {
+        last_ts_ns = perf_events_.back().timestamp_ns;
+    }
+    if (last_ts_ns == 0) return;
+
+    for (const auto &[tid, state] : sched_state_) {
+        int32_t tgid = tgid_for(tid);
+        if (!passes_filter(tgid)) continue;
+
+        int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
+        double start_us = aligner_.align_perf(state.last_event_ns);
+        double end_us = aligner_.align_perf(last_ts_ns);
+        double dur_us = end_us - start_us;
+        if (dur_us <= 0) continue;
+
+        if (state.on_cpu) {
+            std::string args = fmt::format(R"({{"cpu":{}}})", state.last_cpu);
+            writer_.write_complete("on-cpu", "sched", start_us, dur_us,
+                                   tgid, sched_tid, args);
+            perf_written_++;
+        } else {
+            std::string args = fmt::format(
+                R"({{"reason":"{}"}})",
+                prev_state_name(state.off_cpu_reason));
+            writer_.write_complete(
+                prev_state_name(state.off_cpu_reason), "sched.off-cpu",
+                start_us, dur_us, tgid, sched_tid, args);
+            perf_written_++;
+        }
+    }
+}
+
 void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
+    build_tid_map(viz_events);
     write_metadata();
 
     // Two-pointer merge of time-sorted perf events and viz events
@@ -425,6 +579,9 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
         }
     }
 
+    // Close any remaining open scheduler spans
+    flush_sched_state();
+
     if (opts_.verbose) {
         fmt::print(stderr, "Wrote {} perf events and {} viz events\n",
                    perf_written_, viz_written_);
@@ -432,10 +589,12 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
 }
 
 void MergeEngine::write_perf_only() {
+    build_tid_map({});
     write_metadata();
     for (const auto &event : perf_events_) {
         emit_perf_event(event);
     }
+    flush_sched_state();
     if (opts_.verbose) {
         fmt::print(stderr, "Wrote {} perf events\n", perf_written_);
     }

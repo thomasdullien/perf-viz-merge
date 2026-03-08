@@ -6,9 +6,9 @@
 
 #include "clock_aligner.h"
 #include "event_types.h"
-#include "trace_writer.h"
+#include "output_writer.h"
 
-// Merges perf events and VizTracer events into a single Chrome Trace output.
+// Merges perf events and VizTracer events into a single trace output.
 //
 // Strategy:
 // 1. Read all perf events into memory (sorted by timestamp)
@@ -28,7 +28,7 @@ class MergeEngine {
 public:
     using Options = MergeOptions;
 
-    MergeEngine(TraceWriter &writer, ClockAligner &aligner, Options opts = Options{});
+    MergeEngine(OutputWriter &writer, ClockAligner &aligner, Options opts = Options{});
 
     // Add perf events (call before merge)
     void add_perf_events(std::vector<PerfEvent> events,
@@ -47,18 +47,32 @@ public:
     uint64_t viz_events_written() const { return viz_written_; }
 
 private:
-    TraceWriter &writer_;
+    OutputWriter &writer_;
     ClockAligner &aligner_;
     Options opts_;
 
     std::vector<PerfEvent> perf_events_;
     std::unordered_map<int32_t, std::string> comm_map_;
+    // TID → process TGID mapping (built from fork events and perf headers)
+    std::unordered_map<int32_t, int32_t> tid_to_tgid_;
 
-    // Scheduler state: per-thread last switch-in time
-    std::unordered_map<int32_t, uint64_t> sched_switch_in_;
+    // Synthetic TID offsets for separate tracks
+    static constexpr int64_t GIL_TID_OFFSET   = 100000000;
+    static constexpr int64_t SCHED_TID_OFFSET  = 200000000;
 
-    // GIL state: per-thread take_gil start time
+    // Unified scheduler state: per-thread tracking with gap-fill
+    struct SchedState {
+        uint64_t last_event_ns;  // timestamp of last sched event
+        bool on_cpu;              // true = on-cpu, false = off-cpu
+        int64_t off_cpu_reason;   // prev_state when switched out
+        int32_t last_cpu;
+    };
+    std::unordered_map<int32_t, SchedState> sched_state_;
+
+    // GIL state: per-thread take_gil start time (waiting to acquire)
     std::unordered_map<int32_t, uint64_t> gil_start_;
+    // GIL state: per-thread take_gil_return time (holding the GIL)
+    std::unordered_map<int32_t, uint64_t> gil_held_;
 
     uint64_t perf_written_ = 0;
     uint64_t viz_written_ = 0;
@@ -66,9 +80,18 @@ private:
     // Process a single perf event, potentially emitting output events
     void emit_perf_event(const PerfEvent &event);
 
+    // Flush remaining open scheduler spans at trace end
+    void flush_sched_state();
+
     // Write process/thread name metadata events
     void write_metadata();
 
     // Check if event passes PID filter
     bool passes_filter(int32_t pid) const;
+
+    // Look up the process TGID for a TID (falls back to tid itself)
+    int32_t tgid_for(int32_t tid) const;
+
+    // Build tid_to_tgid_ map from fork events and perf event headers
+    void build_tid_map(const std::vector<VizEvent> &viz_events);
 };

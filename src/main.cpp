@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -9,7 +10,9 @@
 #include "clock_aligner.h"
 #include "event_types.h"
 #include "merge_engine.h"
+#include "output_writer.h"
 #include "perf_data_reader.h"
+#include "perfetto_writer.h"
 #include "trace_writer.h"
 #include "viz_json_reader.h"
 
@@ -20,7 +23,8 @@ static void usage(const char *prog) {
         "Options:\n"
         "  --perf <path>          Path to perf.data file\n"
         "  --viz <path>           Path to VizTracer JSON file\n"
-        "  -o, --output <path>    Output file (default: merged.json)\n"
+        "  -o, --output <path>    Output file (default: auto based on format)\n"
+        "  --format <fmt>         Output format: json (default) or perfetto\n"
         "  --time-offset <us>     Manual time offset in microseconds\n"
         "  --filter-pid <pid>     Only include events for this PID\n"
         "  --no-sched             Omit scheduler events\n"
@@ -34,7 +38,8 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     std::string perf_path;
     std::string viz_path;
-    std::string output_path = "merged.json";
+    std::string output_path;
+    std::string format = "json";
     double time_offset = 0;
     bool has_time_offset = false;
     MergeEngine::Options opts;
@@ -55,6 +60,12 @@ int main(int argc, char *argv[]) {
             viz_path = next();
         } else if (arg == "-o" || arg == "--output") {
             output_path = next();
+        } else if (arg == "--format") {
+            format = next();
+            if (format != "json" && format != "perfetto") {
+                fmt::print(stderr, "Error: --format must be 'json' or 'perfetto'\n");
+                return 1;
+            }
         } else if (arg == "--time-offset") {
             time_offset = std::atof(next());
             has_time_offset = true;
@@ -82,6 +93,11 @@ int main(int argc, char *argv[]) {
         fmt::print(stderr, "Error: at least one of --perf or --viz is required\n");
         usage(argv[0]);
         return 1;
+    }
+
+    // Default output filename based on format
+    if (output_path.empty()) {
+        output_path = (format == "perfetto") ? "merged.perfetto-trace" : "merged.json";
     }
 
     // Clock aligner
@@ -178,12 +194,18 @@ int main(int argc, char *argv[]) {
 
     // Create output
     if (opts.verbose) {
-        fmt::print(stderr, "Writing output to {}\n", output_path);
+        fmt::print(stderr, "Writing {} output to {}\n", format, output_path);
     }
 
     try {
-        TraceWriter writer(output_path);
-        MergeEngine engine(writer, aligner, opts);
+        std::unique_ptr<OutputWriter> writer;
+        if (format == "perfetto") {
+            writer = std::make_unique<PerfettoWriter>(output_path);
+        } else {
+            writer = std::make_unique<TraceWriter>(output_path);
+        }
+
+        MergeEngine engine(*writer, aligner, opts);
 
         if (!perf_events.empty()) {
             engine.add_perf_events(std::move(perf_events), comm_map);
@@ -197,9 +219,11 @@ int main(int argc, char *argv[]) {
             engine.write_viz_only(viz_events);
         }
 
+        writer->finalize();
+
         if (opts.verbose) {
             fmt::print(stderr, "Done. Total events written: {}\n",
-                       writer.events_written());
+                       writer->events_written());
         }
     } catch (const std::exception &e) {
         fmt::print(stderr, "Error writing output: {}\n", e.what());
