@@ -176,6 +176,17 @@ int main(int argc, char *argv[]) {
             if (e.ts_us > viz_last) viz_last = e.ts_us;
         }
 
+        if (opts.verbose) {
+            double pf_us = static_cast<double>(perf_first) / 1000.0;
+            double pl_us = static_cast<double>(perf_last) / 1000.0;
+            fmt::print(stderr, "Perf  timestamps: {:.3f} - {:.3f} us (range {:.1f}s)\n",
+                       pf_us, pl_us, (pl_us - pf_us) / 1e6);
+            fmt::print(stderr, "Viz   timestamps: {:.3f} - {:.3f} us (range {:.1f}s)\n",
+                       viz_first, viz_last, (viz_last - viz_first) / 1e6);
+            fmt::print(stderr, "Start difference: {:.3f}s (perf - viz)\n",
+                       (pf_us - viz_first) / 1e6);
+        }
+
         aligner.detect(static_cast<double>(perf_first),
                         static_cast<double>(perf_last),
                         viz_first, viz_last);

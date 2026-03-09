@@ -26,15 +26,30 @@ public:
         double perf_first_us = perf_first_ns / 1000.0;
         double perf_last_us = perf_last_ns / 1000.0;
 
-        // If both are using CLOCK_MONOTONIC, timestamps should be
-        // in the same ballpark (within ~1 second of each other relative
-        // to their ranges).
+        // Detect whether both sources use the same clock.
+        //
+        // Case 1: Both use CLOCK_MONOTONIC — timestamps are large
+        // absolute values (system uptime) and their ranges overlap or
+        // are close.  No offset needed.
+        //
+        // Case 2: VizTracer uses epoch-relative or zero-based timestamps
+        // while perf uses CLOCK_MONOTONIC.  Need to align start times.
+        //
+        // Heuristic: if both first-timestamps are in the same order of
+        // magnitude (both > 1e9 μs = ~17 minutes uptime, which is always
+        // true for CLOCK_MONOTONIC) AND the difference is less than the
+        // combined recording duration, they share the same clock.
         double diff = std::abs(perf_first_us - viz_first_us);
-        double range = std::max(perf_last_us - perf_first_us,
-                                viz_last_us - viz_first_us);
+        double perf_range = perf_last_us - perf_first_us;
+        double viz_range = viz_last_us - viz_first_us;
+        double combined_range = perf_range + viz_range;
 
-        if (range > 0 && diff < range * 0.1) {
-            // Timestamps are close enough — same clock, no offset needed
+        bool both_large = perf_first_us > 1e9 && viz_first_us > 1e9;
+        bool overlapping = diff < combined_range;
+
+        if (both_large && overlapping) {
+            // Same clock (CLOCK_MONOTONIC) — recordings may have started
+            // at different times but timestamps are already comparable.
             offset_us_ = 0.0;
         } else {
             // Different clock bases — align start times
