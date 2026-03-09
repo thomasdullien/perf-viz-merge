@@ -31,7 +31,11 @@ void PerfettoWriter::write_packet(const std::string &packet_data) {
 }
 
 uint64_t PerfettoWriter::track_uuid_for(int64_t pid, int64_t tid) {
-    if (tid >= SCHED_TID_OFFSET) {
+    if (tid >= GPU_TID_OFFSET) {
+        // GPU child track: uuid = 400000000 + real_tid
+        int64_t real_tid = tid - GPU_TID_OFFSET;
+        return 400000000ULL + static_cast<uint64_t>(real_tid);
+    } else if (tid >= SCHED_TID_OFFSET) {
         // Sched child track: uuid = 200000000 + real_tid
         return static_cast<uint64_t>(tid);  // tid already = real_tid + 200000000
     } else if (tid >= GIL_TID_OFFSET) {
@@ -49,10 +53,17 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
     if (defined_tracks_.count(uuid)) return;
     defined_tracks_.insert(uuid);
 
-    if (tid >= SCHED_TID_OFFSET) {
+    if (tid >= GPU_TID_OFFSET) {
+        int64_t real_tid = tid - GPU_TID_OFFSET;
+        uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
+        if (!defined_tracks_.count(parent_uuid)) {
+            defined_tracks_.insert(parent_uuid);
+            emit_thread_track(pid, real_tid, "");
+        }
+        emit_child_track(uuid, parent_uuid, "GPU", 3);
+    } else if (tid >= SCHED_TID_OFFSET) {
         int64_t real_tid = tid - SCHED_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
-        // Ensure parent thread track exists (with empty name; metadata will fill it)
         if (!defined_tracks_.count(parent_uuid)) {
             defined_tracks_.insert(parent_uuid);
             emit_thread_track(pid, real_tid, "");
@@ -285,8 +296,8 @@ void PerfettoWriter::write_metadata(std::string_view name_key, int64_t pid,
     if (name_key == "process_name") {
         emit_process_track(pid, name);
     } else if (name_key == "thread_name") {
-        // Check if this is a synthetic track (sched/GIL)
-        if (tid >= SCHED_TID_OFFSET || tid >= GIL_TID_OFFSET) {
+        // Check if this is a synthetic track (sched/GIL/GPU)
+        if (tid >= GIL_TID_OFFSET) {
             // Child tracks are created on-demand in ensure_track()
             // Just make sure the process track exists
             emit_process_track(pid, "");

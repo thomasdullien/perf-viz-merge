@@ -121,6 +121,7 @@ private:
     // Synthetic TID offsets (must match merge_engine.h)
     static constexpr int64_t GIL_TID_OFFSET = 100000000;
     static constexpr int64_t SCHED_TID_OFFSET = 200000000;
+    static constexpr int64_t GPU_TID_OFFSET = 300000000;
 
     // Perfetto protobuf field numbers
     struct TracePacketFields {
