@@ -312,6 +312,13 @@ PerfEventType PerfDataReader::classify_event(size_t attr_index) const {
         name.find("sched:sched_process_fork") != std::string::npos) {
         return PerfEventType::SchedFork;
     }
+    if (name.find("sched_stat_runtime") != std::string::npos) {
+        return PerfEventType::SchedStatRuntime;
+    }
+    if (name.find("context-switches") != std::string::npos ||
+        name.find("context_switches") != std::string::npos) {
+        return PerfEventType::ContextSwitch;
+    }
     // GIL probes — check more specific names first
     // perf may name return probes as "take_gil_return" or "take_gil_return__return"
     if (name.find("take_gil_return") != std::string::npos ||
@@ -416,6 +423,14 @@ PerfEventType PerfDataReader::classify_event(size_t attr_index) const {
     }
     if (name.find("nccl:reducescatter") != std::string::npos) {
         return PerfEventType::NcclReduceScatter;
+    }
+
+    // Fallback: identify software events by attr type/config
+    if (attr_index < attrs_.size()) {
+        const auto &attr = attrs_[attr_index];
+        if (attr.type == PERF_TYPE_SOFTWARE && attr.config == 3) {
+            return PerfEventType::ContextSwitch;  // PERF_COUNT_SW_CONTEXT_SWITCHES
+        }
     }
 
     return PerfEventType::Other;

@@ -21,10 +21,14 @@
 #   --clean                Remove all probes instead of adding them
 #   --list                 List currently installed probes
 #   --dry-run              Show commands without executing
+#
+# Environment:
+#   PERF                   Path to perf executable (default: perf)
 
 set -euo pipefail
 
 # Defaults
+PERF="${PERF:-perf}"
 PYTHON_LIB=""
 CUDA_LIB=""
 NCCL_LIB=""
@@ -68,15 +72,15 @@ run() {
 # --- List existing probes ---
 if $DO_LIST; then
     echo "=== Installed perf probes ==="
-    perf probe -l 2>/dev/null || echo "(none)"
+    $PERF probe -l 2>/dev/null || echo "(none)"
     exit 0
 fi
 
 # --- Clean all probes ---
 if $DO_CLEAN; then
     echo "Removing all perf probes..."
-    for probe in $(perf probe -l 2>/dev/null | awk '{print $1}' | sed 's/:$//'); do
-        run perf probe -d "$probe"
+    for probe in ($PERF probe -l 2>/dev/null | awk '{print $1}' | sed 's/:$//'); do
+        run $PERF probe -d "$probe"
     done
     echo "Done."
     exit 0
@@ -175,13 +179,13 @@ if $DO_GIL; then
         echo "Using Python library: $PYTHON_LIB"
 
         # When a thread starts trying to acquire the GIL
-        run perf probe -f -x "$PYTHON_LIB" python:take_gil=take_gil
+        run $PERF probe -f -x "$PYTHON_LIB" python:take_gil=take_gil
 
         # When a thread successfully acquires the GIL
-        run perf probe -f -x "$PYTHON_LIB" python:take_gil_return=take_gil%return
+        run $PERF probe -f -x "$PYTHON_LIB" python:take_gil_return=take_gil%return
 
         # When a thread releases the GIL
-        run perf probe -f -x "$PYTHON_LIB" python:drop_gil=drop_gil
+        run $PERF probe -f -x "$PYTHON_LIB" python:drop_gil=drop_gil
     fi
     echo ""
 fi
@@ -203,44 +207,44 @@ if $DO_GPU; then
         echo "Using CUDA library: $CUDA_LIB"
 
         # Kernel launch
-        run perf probe -f -x "$CUDA_LIB" nvidia:launch=cuLaunchKernel
-        run perf probe -f -x "$CUDA_LIB" nvidia:launch_ret=cuLaunchKernel%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:launch=cuLaunchKernel
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:launch_ret=cuLaunchKernel%return
 
         # Stream synchronize
-        run perf probe -f -x "$CUDA_LIB" nvidia:stream_sync=cuStreamSynchronize
-        run perf probe -f -x "$CUDA_LIB" nvidia:stream_sync_ret=cuStreamSynchronize%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:stream_sync=cuStreamSynchronize
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:stream_sync_ret=cuStreamSynchronize%return
 
         # Device synchronize (try both driver and runtime API names)
-        run perf probe -f -x "$CUDA_LIB" nvidia:dev_sync=cuCtxSynchronize
-        run perf probe -f -x "$CUDA_LIB" nvidia:dev_sync_ret=cuCtxSynchronize%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:dev_sync=cuCtxSynchronize
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:dev_sync_ret=cuCtxSynchronize%return
 
         # Event synchronize
-        run perf probe -f -x "$CUDA_LIB" nvidia:event_sync=cuEventSynchronize
-        run perf probe -f -x "$CUDA_LIB" nvidia:event_sync_ret=cuEventSynchronize%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:event_sync=cuEventSynchronize
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:event_sync_ret=cuEventSynchronize%return
 
         # Memory transfers
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_htod=cuMemcpyHtoDAsync_v2
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_htod_ret=cuMemcpyHtoDAsync_v2%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_htod=cuMemcpyHtoDAsync_v2
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_htod_ret=cuMemcpyHtoDAsync_v2%return
 
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_dtoh=cuMemcpyDtoHAsync_v2
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_dtoh_ret=cuMemcpyDtoHAsync_v2%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_dtoh=cuMemcpyDtoHAsync_v2
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_dtoh_ret=cuMemcpyDtoHAsync_v2%return
 
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_dtod=cuMemcpyDtoDAsync_v2
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_dtod_ret=cuMemcpyDtoDAsync_v2%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_dtod=cuMemcpyDtoDAsync_v2
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_dtod_ret=cuMemcpyDtoDAsync_v2%return
 
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_async=cuMemcpyAsync
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_async_ret=cuMemcpyAsync%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_async=cuMemcpyAsync
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_async_ret=cuMemcpyAsync%return
 
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_peer=cuMemcpyPeerAsync
-        run perf probe -f -x "$CUDA_LIB" nvidia:memcpy_peer_ret=cuMemcpyPeerAsync%return
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_peer=cuMemcpyPeerAsync
+        run $PERF probe -f -x "$CUDA_LIB" nvidia:memcpy_peer_ret=cuMemcpyPeerAsync%return
 
         # Memory allocation (optional, can be noisy)
         if $DO_ALLOC; then
-            run perf probe -f -x "$CUDA_LIB" nvidia:malloc=cuMemAlloc_v2
-            run perf probe -f -x "$CUDA_LIB" nvidia:malloc_ret=cuMemAlloc_v2%return
+            run $PERF probe -f -x "$CUDA_LIB" nvidia:malloc=cuMemAlloc_v2
+            run $PERF probe -f -x "$CUDA_LIB" nvidia:malloc_ret=cuMemAlloc_v2%return
 
-            run perf probe -f -x "$CUDA_LIB" nvidia:free=cuMemFree_v2
-            run perf probe -f -x "$CUDA_LIB" nvidia:free_ret=cuMemFree_v2%return
+            run $PERF probe -f -x "$CUDA_LIB" nvidia:free=cuMemFree_v2
+            run $PERF probe -f -x "$CUDA_LIB" nvidia:free_ret=cuMemFree_v2%return
         fi
     fi
     echo ""
@@ -262,14 +266,14 @@ if $DO_NCCL; then
     else
         echo "Using NCCL library: $NCCL_LIB"
 
-        run perf probe -f -x "$NCCL_LIB" nccl:allreduce=ncclAllReduce
-        run perf probe -f -x "$NCCL_LIB" nccl:allreduce_ret=ncclAllReduce%return
+        run $PERF probe -f -x "$NCCL_LIB" nccl:allreduce=ncclAllReduce
+        run $PERF probe -f -x "$NCCL_LIB" nccl:allreduce_ret=ncclAllReduce%return
 
-        run perf probe -f -x "$NCCL_LIB" nccl:broadcast=ncclBroadcast
-        run perf probe -f -x "$NCCL_LIB" nccl:broadcast_ret=ncclBroadcast%return
+        run $PERF probe -f -x "$NCCL_LIB" nccl:broadcast=ncclBroadcast
+        run $PERF probe -f -x "$NCCL_LIB" nccl:broadcast_ret=ncclBroadcast%return
 
-        run perf probe -f -x "$NCCL_LIB" nccl:reducescatter=ncclReduceScatter
-        run perf probe -f -x "$NCCL_LIB" nccl:reducescatter_ret=ncclReduceScatter%return
+        run $PERF probe -f -x "$NCCL_LIB" nccl:reducescatter=ncclReduceScatter
+        run $PERF probe -f -x "$NCCL_LIB" nccl:reducescatter_ret=ncclReduceScatter%return
     fi
     echo ""
 fi
@@ -280,15 +284,17 @@ fi
 echo "========================================"
 echo " Installed probes:"
 echo "========================================"
-perf probe -l 2>/dev/null || echo "(none)"
+$PERF probe -l 2>/dev/null || echo "(none)"
 echo ""
 echo "To record, run:"
-echo "  sudo perf record -g \\"
+echo "  sudo $PERF record -g \\"
 echo "    -e sched:sched_switch \\"
 echo "    -e sched:sched_wakeup \\"
+echo "    -e sched:sched_stat_runtime \\"
+echo "    -e context-switches \\"
 
 # Build the -e flags for installed probes
-for probe in $(perf probe -l 2>/dev/null | awk '{print $1}' | sed 's/:$//'); do
+for probe in $($PERF probe -l 2>/dev/null | awk '{print $1}' | sed 's/:$//'); do
     group=$(echo "$probe" | cut -d: -f1)
     echo "    -e '${group}:*' \\"
 done | sort -u

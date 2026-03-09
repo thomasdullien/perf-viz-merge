@@ -16,6 +16,8 @@ enum class PerfEventType : uint8_t {
     SchedSwitch,
     SchedWakeup,
     SchedFork,
+    SchedStatRuntime,
+    ContextSwitch,
     TakeGil,
     TakeGilReturn,
     DropGil,

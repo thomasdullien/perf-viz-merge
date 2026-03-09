@@ -527,6 +527,39 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         break;
     }
 
+    case PerfEventType::SchedStatRuntime:
+    case PerfEventType::ContextSwitch: {
+        if (!opts_.include_sched) return;
+        int32_t tid = event.tid;
+        int32_t tgid = tgid_for(tid);
+        if (!passes_filter(tgid)) return;
+
+        auto it = sched_state_.find(tid);
+        if (it == sched_state_.end() || !it->second.on_cpu) {
+            // Thread was off-cpu or unknown → transition to on-cpu
+            int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
+            if (it != sched_state_.end()) {
+                // Close off-cpu span
+                double start_us = aligner_.align_perf(it->second.last_event_ns);
+                double dur_us = ts_us - start_us;
+                if (dur_us > 0) {
+                    std::string args = fmt::format(
+                        R"({{"reason":"{}"}})",
+                        prev_state_name(it->second.off_cpu_reason));
+                    writer_.write_complete(
+                        prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                        start_us, dur_us,
+                        tgid, sched_tid, args);
+                    perf_written_++;
+                }
+            }
+            sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
+        }
+        // If already on-cpu: no-op (don't update last_event_ns to avoid
+        // fragmenting one continuous on-cpu span into tick-sized pieces)
+        break;
+    }
+
     default:
         break;
     }
