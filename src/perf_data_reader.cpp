@@ -616,6 +616,59 @@ bool PerfDataReader::decode_sample(const uint8_t *payload, size_t payload_size,
             out.data.sched_switch.next_tid = out.data.sched_switch.next_pid;
         }
 
+        if (out.type == PerfEventType::SchedWakeup) {
+            // sched_wakeup tracepoint layout:
+            //   Common fields (8 bytes): type(2)+flags(1)+preempt_count(1)+pid(4)
+            //   char comm[16]   (offset 8)  — target task name
+            //   pid_t pid (4)   (offset 24) — target TID
+            //   int prio (4)    (offset 28) — target priority
+            //   int target_cpu (4) (offset 32) — target CPU
+            // Total with common: 36 bytes; without: 28 bytes
+
+            const size_t COMMON_SIZE = 8;
+            size_t base = 0;
+
+            if (raw_size >= COMMON_SIZE + 24) {
+                base = COMMON_SIZE;
+            } else if (raw_size >= 24) {
+                base = 0;
+            } else {
+                p += raw_size;
+                return true;
+            }
+
+            // target TID is at base + 16 (after comm[16])
+            if (base + 20 <= raw_size) {
+                int32_t target_pid;
+                std::memcpy(&target_pid, raw_data + base + 16, 4);
+                out.data.wakeup.target_tid = target_pid;
+                out.data.wakeup.target_pid = target_pid;
+            }
+        }
+
+        if (out.type == PerfEventType::SchedFork) {
+            // sched_process_fork tracepoint layout:
+            //   Common fields (8 bytes)
+            //   char parent_comm[16]  (offset 8)
+            //   pid_t parent_pid (4)  (offset 24)
+            //   char child_comm[16]   (offset 28)
+            //   pid_t child_pid (4)   (offset 44)
+            const size_t COMMON_SIZE = 8;
+            size_t base = 0;
+
+            if (raw_size >= COMMON_SIZE + 40) {
+                base = COMMON_SIZE;
+            } else if (raw_size >= 40) {
+                base = 0;
+            }
+
+            if (base + 40 <= raw_size) {
+                std::memcpy(&out.data.fork.parent_tid, raw_data + base + 16, 4);
+                std::memcpy(&out.data.fork.child_pid, raw_data + base + 36, 4);
+                out.data.fork.child_tid = out.data.fork.child_pid;
+            }
+        }
+
         p += raw_size;
     }
 
