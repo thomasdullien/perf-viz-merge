@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "clock_aligner.h"
@@ -59,6 +60,7 @@ private:
     // Synthetic TID offsets for separate tracks
     static constexpr int64_t GIL_TID_OFFSET   = 100000000;
     static constexpr int64_t SCHED_TID_OFFSET  = 200000000;
+    static constexpr int64_t GPU_TID_OFFSET    = 300000000;
 
     // Unified scheduler state: per-thread tracking with gap-fill
     struct SchedState {
@@ -74,8 +76,21 @@ private:
     // GIL state: per-thread take_gil_return time (holding the GIL)
     std::unordered_map<int32_t, uint64_t> gil_held_;
 
+    // GPU/NCCL dedup: per-tid set of currently open span names
+    // (to handle duplicate probes like nvidia:launch + nvidia:launch_1)
+    std::unordered_map<int32_t, std::unordered_set<std::string>> gpu_open_;
+
     uint64_t perf_written_ = 0;
     uint64_t viz_written_ = 0;
+    uint64_t sched_mismatch_count_ = 0;
+    uint64_t sched_switch_total_ = 0;
+    uint64_t sched_switch_filtered_ = 0;
+    uint64_t sched_switch_no_state_ = 0;
+    uint64_t sched_switch_already_off_ = 0;
+    uint64_t sched_switch_off_transition_ = 0;
+    double offcpu_total_us_ = 0;
+    uint64_t offcpu_count_ = 0;
+    uint64_t cs_same_ts_count_ = 0;
 
     // Process a single perf event, potentially emitting output events
     void emit_perf_event(const PerfEvent &event);

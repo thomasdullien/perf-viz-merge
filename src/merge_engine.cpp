@@ -50,14 +50,46 @@ void MergeEngine::add_perf_events(
     perf_events_ = std::move(events);
     comm_map_ = comm_map;
 
-    // Sort by timestamp
+    // Sort by timestamp, with sched_switch last at equal timestamps.
+    // sched_stat_runtime fires from update_curr() just before sched_switch
+    // and can share the same timestamp.  If sched_switch sorts first it
+    // marks the thread off-cpu, then sched_stat_runtime immediately undoes
+    // it — corrupting the state machine.
     std::sort(perf_events_.begin(), perf_events_.end(),
               [](const PerfEvent &a, const PerfEvent &b) {
-                  return a.timestamp_ns < b.timestamp_ns;
+                  if (a.timestamp_ns != b.timestamp_ns)
+                      return a.timestamp_ns < b.timestamp_ns;
+                  // At equal timestamps: SchedSwitch last (priority 1)
+                  auto pri = [](PerfEventType t) -> int {
+                      return t == PerfEventType::SchedSwitch ? 1 : 0;
+                  };
+                  return pri(a.type) < pri(b.type);
               });
 
     if (opts_.verbose) {
+        // Per-type event counts
+        std::unordered_map<uint8_t, size_t> type_counts;
+        for (const auto &e : perf_events_)
+            type_counts[static_cast<uint8_t>(e.type)]++;
+        auto cname = [](PerfEventType t) -> const char * {
+            switch (t) {
+            case PerfEventType::SchedSwitch:      return "SchedSwitch";
+            case PerfEventType::SchedWakeup:      return "SchedWakeup";
+            case PerfEventType::SchedFork:        return "SchedFork";
+            case PerfEventType::SchedStatRuntime: return "SchedStatRuntime";
+            case PerfEventType::ContextSwitch:    return "ContextSwitch";
+            case PerfEventType::TakeGil:          return "TakeGil";
+            case PerfEventType::TakeGilReturn:    return "TakeGilReturn";
+            case PerfEventType::DropGil:          return "DropGil";
+            case PerfEventType::Other:            return "Other";
+            default:                              return "GPU/NCCL";
+            }
+        };
         fmt::print(stderr, "Loaded {} perf events\n", perf_events_.size());
+        for (const auto &[t, n] : type_counts) {
+            fmt::print(stderr, "  {:20s}: {}\n",
+                       cname(static_cast<PerfEventType>(t)), n);
+        }
     }
 }
 
@@ -136,16 +168,23 @@ void MergeEngine::write_metadata() {
         writer_.write_metadata("process_name", pid, 0, args);
     }
 
-    // Emit metadata for synthetic GIL and sched tracks, with sort order:
-    // sort_index 0 = sched track, 1 = GIL track, 2 = call stacks (default)
-    for (int32_t tid : seen_tids) {
+    // Emit metadata for synthetic GIL, sched, and GPU tracks.
+    // Use per-thread sort indices so all tracks for the same thread are
+    // adjacent: sched(+0), GIL(+1), call stacks(+2), GPU(+3).
+    // Sort tids so the output order is deterministic.
+    std::vector<int32_t> sorted_tids(seen_tids.begin(), seen_tids.end());
+    std::sort(sorted_tids.begin(), sorted_tids.end());
+
+    for (size_t i = 0; i < sorted_tids.size(); i++) {
+        int32_t tid = sorted_tids[i];
         auto comm_it = comm_map_.find(tid);
         std::string base = comm_it != comm_map_.end() ? comm_it->second : std::to_string(tid);
         int32_t tgid = tgid_for(tid);
+        int sort_base = static_cast<int>(i) * 4;
 
         // Sort index for the real thread (call stacks)
         writer_.write_metadata("thread_sort_index", tgid, tid,
-                               R"({"sort_index":2})");
+                               fmt::format(R"({{"sort_index":{}}})", sort_base + 2));
 
         if (opts_.include_sched) {
             int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
@@ -153,7 +192,7 @@ void MergeEngine::write_metadata() {
             std::string args = fmt::format(R"({{"name":"{}"}})", sched_name);
             writer_.write_metadata("thread_name", tgid, sched_tid, args);
             writer_.write_metadata("thread_sort_index", tgid, sched_tid,
-                                   R"({"sort_index":0})");
+                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 0));
         }
         if (opts_.include_gil) {
             int64_t gil_tid = static_cast<int64_t>(tid) + GIL_TID_OFFSET;
@@ -161,7 +200,15 @@ void MergeEngine::write_metadata() {
             std::string args = fmt::format(R"({{"name":"{}"}})", gil_name);
             writer_.write_metadata("thread_name", tgid, gil_tid, args);
             writer_.write_metadata("thread_sort_index", tgid, gil_tid,
-                                   R"({"sort_index":1})");
+                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 1));
+        }
+        if (opts_.include_gpu) {
+            int64_t gpu_tid = static_cast<int64_t>(tid) + GPU_TID_OFFSET;
+            std::string gpu_name = fmt::format("{} [GPU]", base);
+            std::string args = fmt::format(R"({{"name":"{}"}})", gpu_name);
+            writer_.write_metadata("thread_name", tgid, gpu_tid, args);
+            writer_.write_metadata("thread_sort_index", tgid, gpu_tid,
+                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 3));
         }
     }
 }
@@ -175,9 +222,48 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
         int32_t prev_tid = event.data.sched_switch.prev_tid;
         int32_t next_tid = event.data.sched_switch.next_tid;
+
+        // Sanity check: sample header tid should match raw prev_tid
+        if (opts_.verbose) {
+            if (prev_tid == 0 && next_tid == 0) {
+                sched_mismatch_count_++;
+                if (sched_mismatch_count_ <= 5) {
+                    fmt::print(stderr,
+                        "WARNING: sched_switch has zero prev_tid AND next_tid "
+                        "(raw data not parsed?), header tid={}\n",
+                        event.tid);
+                }
+            } else if (prev_tid != event.tid) {
+                sched_mismatch_count_++;
+                if (sched_mismatch_count_ <= 5) {
+                    fmt::print(stderr,
+                        "WARNING: sched_switch prev_tid mismatch: "
+                        "raw={} header={} (prev_comm={}, next_tid={})\n",
+                        prev_tid, event.tid,
+                        event.data.sched_switch.prev_comm, next_tid);
+                }
+            }
+        }
+
         // Use TGID map — kernel sched_switch "pid" is actually TID
         int32_t prev_tgid = tgid_for(prev_tid);
         int32_t next_tgid = tgid_for(next_tid);
+
+        // Diagnostic counters
+        if (opts_.verbose) {
+            sched_switch_total_++;
+            if (!passes_filter(prev_tgid))
+                sched_switch_filtered_++;
+            else {
+                auto it = sched_state_.find(prev_tid);
+                if (it == sched_state_.end())
+                    sched_switch_no_state_++;
+                else if (!it->second.on_cpu)
+                    sched_switch_already_off_++;
+                else
+                    sched_switch_off_transition_++;
+            }
+        }
         int64_t sched_prev_tid = static_cast<int64_t>(prev_tid) + SCHED_TID_OFFSET;
         int64_t sched_next_tid = static_cast<int64_t>(next_tid) + SCHED_TID_OFFSET;
 
@@ -207,7 +293,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         }
 
         // next_tid is being switched IN
-        if (passes_filter(next_tgid)) {
+        // Only process if next_tid is a known thread of our process.
+        // With per-process recording, next_tid is often an external
+        // thread — skip those to avoid phantom sched entries.
+        if (passes_filter(next_tgid) && tid_to_tgid_.count(next_tid)) {
             auto it = sched_state_.find(next_tid);
             if (it != sched_state_.end() && !it->second.on_cpu) {
                 // Close off-CPU span: from last_event_ns to now
@@ -237,13 +326,40 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
     case PerfEventType::SchedWakeup: {
         if (!opts_.include_sched) return;
-        int32_t target_tgid = tgid_for(event.data.wakeup.target_tid);
+        int32_t target_tid = event.data.wakeup.target_tid;
+        if (target_tid == 0) break;  // unparsed wakeup
+        int32_t target_tgid = tgid_for(target_tid);
         if (!passes_filter(target_tgid)) return;
 
-        int64_t sched_tid = static_cast<int64_t>(event.data.wakeup.target_tid) + SCHED_TID_OFFSET;
-        std::string args = fmt::format(
-            R"({{"target_tid":{}}})", event.data.wakeup.target_tid);
+        int64_t sched_tid = static_cast<int64_t>(target_tid) + SCHED_TID_OFFSET;
 
+        // Wakeup means the target thread is transitioning from sleeping to
+        // runnable.  Use this to close any open off-cpu span — it's the
+        // most precise switch-in indicator we have with per-process recording.
+        auto it = sched_state_.find(target_tid);
+        if (it != sched_state_.end() && !it->second.on_cpu) {
+            double start_us = aligner_.align_perf(it->second.last_event_ns);
+            double dur_us = ts_us - start_us;
+            if (opts_.verbose) {
+                offcpu_total_us_ += dur_us;
+                offcpu_count_++;
+            }
+            if (dur_us > 0) {
+                std::string args = fmt::format(
+                    R"({{"reason":"{}"}})",
+                    prev_state_name(it->second.off_cpu_reason));
+                writer_.write_complete(
+                    prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                    start_us, dur_us,
+                    target_tgid, sched_tid, args);
+                perf_written_++;
+            }
+            sched_state_[target_tid] = {event.timestamp_ns, true, 0, event.cpu};
+        }
+
+        // Also emit the wakeup instant marker
+        std::string args = fmt::format(
+            R"({{"target_tid":{}}})", target_tid);
         writer_.write_instant("sched_wakeup", "sched", ts_us,
                               target_tgid, sched_tid, "t", args);
         perf_written_++;
@@ -270,6 +386,9 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid)) return;
 
+        // Skip if already acquiring (duplicate probe)
+        if (gil_start_.count(event.tid)) break;
+
         int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         gil_start_[event.tid] = event.timestamp_ns;
         writer_.write_begin("GIL acquire", "gil", ts_us,
@@ -289,6 +408,9 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                               event.pid, gil_tid);
             perf_written_++;
             gil_start_.erase(it);
+        } else {
+            // Duplicate probe firing — acquire already closed
+            break;
         }
         // Start a "GIL held" span — closed by drop_gil
         gil_held_[event.tid] = event.timestamp_ns;
@@ -314,234 +436,133 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     }
 
     // --- NVIDIA CUDA events ---
-    case PerfEventType::NvidiaLaunch: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuLaunchKernel", "gpu", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaLaunchReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuLaunchKernel", "gpu", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaStreamSync: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuStreamSynchronize", "gpu.sync", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaStreamSyncReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuStreamSynchronize", "gpu.sync", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaDeviceSync: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cudaDeviceSynchronize", "gpu.sync", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaDeviceSyncReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cudaDeviceSynchronize", "gpu.sync", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaEventSync: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuEventSynchronize", "gpu.sync", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaEventSyncReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuEventSynchronize", "gpu.sync", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    // --- Memory transfers ---
-    case PerfEventType::NvidiaMemcpyHtoD: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemcpyHtoD", "gpu.memcpy", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMemcpyHtoDReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemcpyHtoD", "gpu.memcpy", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaMemcpyDtoH: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemcpyDtoH", "gpu.memcpy", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMemcpyDtoHReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemcpyDtoH", "gpu.memcpy", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaMemcpyDtoD: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemcpyDtoD", "gpu.memcpy", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMemcpyDtoDReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemcpyDtoD", "gpu.memcpy", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaMemcpyAsync: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemcpyAsync", "gpu.memcpy", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMemcpyAsyncReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemcpyAsync", "gpu.memcpy", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaMemcpyPeer: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemcpyPeerAsync", "gpu.memcpy", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMemcpyPeerReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemcpyPeerAsync", "gpu.memcpy", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    // --- Memory allocation ---
-    case PerfEventType::NvidiaMalloc: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemAlloc", "gpu.alloc", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaMallocReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemAlloc", "gpu.alloc", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NvidiaFree: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("cuMemFree", "gpu.alloc", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NvidiaFreeReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("cuMemFree", "gpu.alloc", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    // --- NCCL collectives ---
-    case PerfEventType::NcclAllReduce: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("ncclAllReduce", "nccl", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NcclAllReduceReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("ncclAllReduce", "nccl", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
-    case PerfEventType::NcclBroadcast: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("ncclBroadcast", "nccl", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NcclBroadcastReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("ncclBroadcast", "nccl", ts_us,
-                          event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-
+    // All GPU/NCCL begin/end events use GPU_TID_OFFSET for a separate
+    // track and gpu_open_ for deduplication (duplicate probes like
+    // nvidia:launch + nvidia:launch_1).
+    case PerfEventType::NvidiaLaunch:
+    case PerfEventType::NvidiaStreamSync:
+    case PerfEventType::NvidiaDeviceSync:
+    case PerfEventType::NvidiaEventSync:
+    case PerfEventType::NvidiaMemcpyHtoD:
+    case PerfEventType::NvidiaMemcpyDtoH:
+    case PerfEventType::NvidiaMemcpyDtoD:
+    case PerfEventType::NvidiaMemcpyAsync:
+    case PerfEventType::NvidiaMemcpyPeer:
+    case PerfEventType::NvidiaMalloc:
+    case PerfEventType::NvidiaFree:
+    case PerfEventType::NcclAllReduce:
+    case PerfEventType::NcclBroadcast:
     case PerfEventType::NcclReduceScatter: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_begin("ncclReduceScatter", "nccl", ts_us,
-                            event.pid, event.tid);
-        perf_written_++;
-        break;
-    }
-    case PerfEventType::NcclReduceScatterReturn: {
-        if (!opts_.include_gpu || !passes_filter(event.pid)) return;
-        writer_.write_end("ncclReduceScatter", "nccl", ts_us,
-                          event.pid, event.tid);
+        if (!opts_.include_gpu) return;
+        int32_t tgid = tgid_for(event.tid);
+        if (!passes_filter(tgid)) return;
+        const char *name, *cat;
+        switch (event.type) {
+        case PerfEventType::NvidiaLaunch:       name = "cuLaunchKernel";       cat = "gpu"; break;
+        case PerfEventType::NvidiaStreamSync:   name = "cuStreamSynchronize";  cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaDeviceSync:   name = "cudaDeviceSynchronize";cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaEventSync:    name = "cuEventSynchronize";   cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaMemcpyHtoD:   name = "cuMemcpyHtoD";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyDtoH:   name = "cuMemcpyDtoH";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyDtoD:   name = "cuMemcpyDtoD";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyAsync:  name = "cuMemcpyAsync";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyPeer:   name = "cuMemcpyPeerAsync";    cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMalloc:       name = "cuMemAlloc";           cat = "gpu.alloc"; break;
+        case PerfEventType::NvidiaFree:         name = "cuMemFree";            cat = "gpu.alloc"; break;
+        case PerfEventType::NcclAllReduce:      name = "ncclAllReduce";        cat = "nccl"; break;
+        case PerfEventType::NcclBroadcast:      name = "ncclBroadcast";        cat = "nccl"; break;
+        case PerfEventType::NcclReduceScatter:  name = "ncclReduceScatter";    cat = "nccl"; break;
+        default: return;
+        }
+        // Dedup: skip if this span is already open for this tid
+        if (gpu_open_[event.tid].count(name)) break;
+        gpu_open_[event.tid].insert(name);
+        int64_t gpu_tid = static_cast<int64_t>(event.tid) + GPU_TID_OFFSET;
+        writer_.write_begin(name, cat, ts_us, tgid, gpu_tid);
         perf_written_++;
         break;
     }
 
-    case PerfEventType::SchedStatRuntime:
+    case PerfEventType::NvidiaLaunchReturn:
+    case PerfEventType::NvidiaStreamSyncReturn:
+    case PerfEventType::NvidiaDeviceSyncReturn:
+    case PerfEventType::NvidiaEventSyncReturn:
+    case PerfEventType::NvidiaMemcpyHtoDReturn:
+    case PerfEventType::NvidiaMemcpyDtoHReturn:
+    case PerfEventType::NvidiaMemcpyDtoDReturn:
+    case PerfEventType::NvidiaMemcpyAsyncReturn:
+    case PerfEventType::NvidiaMemcpyPeerReturn:
+    case PerfEventType::NvidiaMallocReturn:
+    case PerfEventType::NvidiaFreeReturn:
+    case PerfEventType::NcclAllReduceReturn:
+    case PerfEventType::NcclBroadcastReturn:
+    case PerfEventType::NcclReduceScatterReturn: {
+        if (!opts_.include_gpu) return;
+        int32_t tgid = tgid_for(event.tid);
+        if (!passes_filter(tgid)) return;
+        const char *name, *cat;
+        switch (event.type) {
+        case PerfEventType::NvidiaLaunchReturn:       name = "cuLaunchKernel";       cat = "gpu"; break;
+        case PerfEventType::NvidiaStreamSyncReturn:   name = "cuStreamSynchronize";  cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaDeviceSyncReturn:   name = "cudaDeviceSynchronize";cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaEventSyncReturn:    name = "cuEventSynchronize";   cat = "gpu.sync"; break;
+        case PerfEventType::NvidiaMemcpyHtoDReturn:   name = "cuMemcpyHtoD";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyDtoHReturn:   name = "cuMemcpyDtoH";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyDtoDReturn:   name = "cuMemcpyDtoD";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyAsyncReturn:  name = "cuMemcpyAsync";        cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMemcpyPeerReturn:   name = "cuMemcpyPeerAsync";    cat = "gpu.memcpy"; break;
+        case PerfEventType::NvidiaMallocReturn:       name = "cuMemAlloc";           cat = "gpu.alloc"; break;
+        case PerfEventType::NvidiaFreeReturn:         name = "cuMemFree";            cat = "gpu.alloc"; break;
+        case PerfEventType::NcclAllReduceReturn:      name = "ncclAllReduce";        cat = "nccl"; break;
+        case PerfEventType::NcclBroadcastReturn:      name = "ncclBroadcast";        cat = "nccl"; break;
+        case PerfEventType::NcclReduceScatterReturn:  name = "ncclReduceScatter";    cat = "nccl"; break;
+        default: return;
+        }
+        // Dedup: only close if we have an open span
+        auto oit = gpu_open_.find(event.tid);
+        if (oit == gpu_open_.end() || !oit->second.count(name)) break;
+        oit->second.erase(name);
+        int64_t gpu_tid = static_cast<int64_t>(event.tid) + GPU_TID_OFFSET;
+        writer_.write_end(name, cat, ts_us, tgid, gpu_tid);
+        perf_written_++;
+        break;
+    }
+
     case PerfEventType::ContextSwitch: {
+        // context-switches (PERF_COUNT_SW_CONTEXT_SWITCHES) fires on
+        // EVERY context switch — both switch-out and switch-in — in
+        // the task's perf event context.  With -p PID, this means it
+        // fires twice per scheduling cycle for our threads: once at
+        // switch-out (same time as sched_switch) and once at switch-in.
+        //
+        // To distinguish: if the thread was JUST marked off-cpu at the
+        // same timestamp by sched_switch, this is the switch-out firing
+        // and we must ignore it.  A real switch-in will have a later
+        // timestamp than the last sched_switch for this thread.
         if (!opts_.include_sched) return;
         int32_t tid = event.tid;
         int32_t tgid = tgid_for(tid);
         if (!passes_filter(tgid)) return;
 
         auto it = sched_state_.find(tid);
-        if (it == sched_state_.end() || !it->second.on_cpu) {
-            // Thread was off-cpu or unknown → transition to on-cpu
-            int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
-            if (it != sched_state_.end()) {
-                // Close off-cpu span
+        if (it == sched_state_.end()) {
+            // First event for this thread — set initial on-cpu state
+            sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
+        } else if (!it->second.on_cpu) {
+            // Thread is off-cpu.  context-switches fires for BOTH
+            // switch-out and switch-in.  The switch-out event arrives
+            // ~1-2μs after sched_switch.  Real switch-ins have a much
+            // larger gap (the actual sleep duration).  Filter out the
+            // switch-out echo by requiring a minimum gap of 10μs.
+            uint64_t gap_ns = event.timestamp_ns - it->second.last_event_ns;
+            if (gap_ns > 10000) {  // > 10μs
+                int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
                 double start_us = aligner_.align_perf(it->second.last_event_ns);
                 double dur_us = ts_us - start_us;
+                if (opts_.verbose) {
+                    offcpu_total_us_ += dur_us;
+                    offcpu_count_++;
+                }
                 if (dur_us > 0) {
                     std::string args = fmt::format(
                         R"({{"reason":"{}"}})",
@@ -552,11 +573,60 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                         tgid, sched_tid, args);
                     perf_written_++;
                 }
+                sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
             }
-            sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
+            // else: too close to switch-out → this is the switch-out
+            // context-switch echo, ignore it.
+            else if (opts_.verbose) {
+                cs_same_ts_count_++;
+            }
         }
-        // If already on-cpu: no-op (don't update last_event_ns to avoid
-        // fragmenting one continuous on-cpu span into tick-sized pieces)
+        break;
+    }
+
+    case PerfEventType::SchedStatRuntime: {
+        // sched_stat_runtime is a periodic ~4ms heartbeat confirming
+        // the thread is on-CPU.  It fires from update_curr(), which
+        // also runs just before sched_switch — so a sched_stat_runtime
+        // at near-identical timestamp as a sched_switch is the pre-
+        // switch-out tick, NOT evidence of a switch-in.
+        //
+        // Use a 10μs minimum gap: if the thread went off-cpu less than
+        // 10μs ago, this is the pre-switch tick and should be ignored.
+        // Real switch-ins have gaps of at least tens of microseconds.
+        if (!opts_.include_sched) return;
+        int32_t tid = event.tid;
+        int32_t tgid = tgid_for(tid);
+        if (!passes_filter(tgid)) return;
+
+        auto it = sched_state_.find(tid);
+        if (it == sched_state_.end()) {
+            // First event for this thread — set initial on-cpu state
+            sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
+        } else if (!it->second.on_cpu) {
+            uint64_t gap_ns = event.timestamp_ns - it->second.last_event_ns;
+            if (gap_ns > 10000) {  // > 10μs
+                int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
+                double start_us = aligner_.align_perf(it->second.last_event_ns);
+                double dur_us = ts_us - start_us;
+                if (opts_.verbose) {
+                    offcpu_total_us_ += dur_us;
+                    offcpu_count_++;
+                }
+                if (dur_us > 0) {
+                    std::string args = fmt::format(
+                        R"({{"reason":"{}"}})",
+                        prev_state_name(it->second.off_cpu_reason));
+                    writer_.write_complete(
+                        prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                        start_us, dur_us,
+                        tgid, sched_tid, args);
+                    perf_written_++;
+                }
+                sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
+            }
+        }
+        // If already on-cpu: no-op
         break;
     }
 
@@ -658,6 +728,26 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
     if (opts_.verbose) {
         fmt::print(stderr, "Wrote {} perf events and {} viz events\n",
                    perf_written_, viz_written_);
+        if (sched_mismatch_count_ > 0) {
+            fmt::print(stderr,
+                "WARNING: {} sched_switch events had prev_tid mismatch "
+                "(raw data offsets may be wrong for this kernel)\n",
+                sched_mismatch_count_);
+        }
+        fmt::print(stderr,
+            "Sched switch breakdown: total={} filtered={} no_state={} "
+            "already_off={} off_transition={}\n",
+            sched_switch_total_, sched_switch_filtered_,
+            sched_switch_no_state_, sched_switch_already_off_,
+            sched_switch_off_transition_);
+        if (offcpu_count_ > 0) {
+            fmt::print(stderr,
+                "Off-cpu spans: count={} total={:.1f}s avg={:.1f}us "
+                "(cs_same_ts_filtered={})\n",
+                offcpu_count_, offcpu_total_us_ / 1e6,
+                offcpu_total_us_ / offcpu_count_,
+                cs_same_ts_count_);
+        }
     }
 }
 
