@@ -114,80 +114,36 @@ fi
 echo ""
 echo "--- Test 2: Basic merge ---"
 
-MERGED_OUTPUT="$TEST_OUTPUT_DIR/merged.json"
+MERGED_OUTPUT="$TEST_OUTPUT_DIR/merged.perfetto-trace"
 
 if "$BINARY" --perf "$PERF_DATA" --viz "$TRACE_JSON" -o "$MERGED_OUTPUT" 2>"$TEST_OUTPUT_DIR/merge_stderr.txt"; then
     pass "perf-viz-merge ran successfully"
 else
     fail "perf-viz-merge failed (exit code $?)"
-    echo "  stderr:"
     cat "$TEST_OUTPUT_DIR/merge_stderr.txt" | head -20
 fi
 
 # ----------------------------------------
-# Test 3: Validate output JSON
+# Test 3: Validate output Perfetto trace
 # ----------------------------------------
 echo ""
-echo "--- Test 3: Validate output JSON ---"
+echo "--- Test 3: Validate output Perfetto trace ---"
 
 if [ -f "$MERGED_OUTPUT" ]; then
-    # Check it's valid JSON
-    if python3 -c "import json; json.load(open('$MERGED_OUTPUT'))" 2>/dev/null; then
-        pass "Output is valid JSON"
+    # Check file is non-empty
+    FILE_SIZE=$(stat -c%s "$MERGED_OUTPUT" 2>/dev/null || echo "0")
+    if [ "$FILE_SIZE" -gt 0 ]; then
+        pass "Output is non-empty ($FILE_SIZE bytes)"
     else
-        fail "Output is not valid JSON"
+        fail "Output file is empty"
     fi
 
-    # Check it has traceEvents
-    EVENT_COUNT=$(python3 -c "
-import json
-d = json.load(open('$MERGED_OUTPUT'))
-events = d.get('traceEvents', [])
-print(len(events))
-" 2>/dev/null || echo "0")
-
-    if [ "$EVENT_COUNT" -gt 0 ]; then
-        pass "Output contains $EVENT_COUNT trace events"
+    # Check that it starts with a valid protobuf tag (field 1, wire type 2 = 0x0a)
+    FIRST_BYTE=$(od -A n -t x1 -N 1 "$MERGED_OUTPUT" 2>/dev/null | tr -d ' ')
+    if [ "$FIRST_BYTE" = "0a" ]; then
+        pass "Output starts with valid Perfetto protobuf tag"
     else
-        fail "Output contains no trace events"
-    fi
-
-    # Check that events have required fields
-    VALID_EVENTS=$(python3 -c "
-import json
-d = json.load(open('$MERGED_OUTPUT'))
-events = d.get('traceEvents', [])
-required = {'ph', 'ts', 'pid', 'tid'}
-valid = sum(1 for e in events if required.issubset(e.keys()))
-print(valid)
-" 2>/dev/null || echo "0")
-
-    if [ "$VALID_EVENTS" = "$EVENT_COUNT" ]; then
-        pass "All events have required Chrome Trace fields (ph, ts, pid, tid)"
-    else
-        fail "Only $VALID_EVENTS/$EVENT_COUNT events have required fields"
-    fi
-
-    # Check that we have events from both sources
-    CATEGORIES=$(python3 -c "
-import json
-d = json.load(open('$MERGED_OUTPUT'))
-events = d.get('traceEvents', [])
-cats = set(e.get('cat', '') for e in events)
-print(' '.join(sorted(cats)))
-" 2>/dev/null || echo "")
-
-    echo "  Categories found: $CATEGORIES"
-    if echo "$CATEGORIES" | grep -q "python"; then
-        pass "Output contains python (VizTracer) events"
-    else
-        fail "Output missing python (VizTracer) events"
-    fi
-
-    if echo "$CATEGORIES" | grep -q "sched"; then
-        pass "Output contains sched (perf) events"
-    else
-        skip "Output missing sched (perf) events (may be expected with synthetic data)"
+        fail "Output does not start with expected protobuf tag (got 0x$FIRST_BYTE)"
     fi
 else
     fail "Merged output file not found"
@@ -199,7 +155,7 @@ fi
 echo ""
 echo "--- Test 4: Verbose mode ---"
 
-VERBOSE_OUTPUT="$TEST_OUTPUT_DIR/merged_verbose.json"
+VERBOSE_OUTPUT="$TEST_OUTPUT_DIR/merged_verbose.perfetto-trace"
 if "$BINARY" --perf "$PERF_DATA" --viz "$TRACE_JSON" -o "$VERBOSE_OUTPUT" -v 2>"$TEST_OUTPUT_DIR/verbose_stderr.txt"; then
     if grep -q "events" "$TEST_OUTPUT_DIR/verbose_stderr.txt" 2>/dev/null; then
         pass "Verbose mode produces progress output"
@@ -216,18 +172,14 @@ fi
 echo ""
 echo "--- Test 5: VizTracer-only mode ---"
 
-VIZ_ONLY_OUTPUT="$TEST_OUTPUT_DIR/viz_only.json"
+VIZ_ONLY_OUTPUT="$TEST_OUTPUT_DIR/viz_only.perfetto-trace"
 if "$BINARY" --viz "$TRACE_JSON" -o "$VIZ_ONLY_OUTPUT" 2>/dev/null; then
     if [ -f "$VIZ_ONLY_OUTPUT" ]; then
-        VIZ_COUNT=$(python3 -c "
-import json
-d = json.load(open('$VIZ_ONLY_OUTPUT'))
-print(len(d.get('traceEvents', [])))
-" 2>/dev/null || echo "0")
-        if [ "$VIZ_COUNT" -gt 0 ]; then
-            pass "VizTracer-only mode produced $VIZ_COUNT events"
+        VIZ_SIZE=$(stat -c%s "$VIZ_ONLY_OUTPUT" 2>/dev/null || echo "0")
+        if [ "$VIZ_SIZE" -gt 0 ]; then
+            pass "VizTracer-only mode produced non-empty output ($VIZ_SIZE bytes)"
         else
-            fail "VizTracer-only mode produced no events"
+            fail "VizTracer-only mode produced empty output"
         fi
     else
         fail "VizTracer-only output file not created"

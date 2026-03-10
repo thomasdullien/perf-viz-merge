@@ -162,8 +162,8 @@ private:
     };
 
     struct ThreadDescriptorFields {
-        static constexpr uint32_t tid = 1;
-        static constexpr uint32_t pid = 4;
+        static constexpr uint32_t pid = 1;
+        static constexpr uint32_t tid = 2;
         static constexpr uint32_t thread_name = 5;
     };
 

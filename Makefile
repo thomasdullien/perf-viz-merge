@@ -20,7 +20,6 @@ SRCS := src/main.cpp \
         src/perf_data_reader.cpp \
         src/viz_json_reader.cpp \
         src/merge_engine.cpp \
-        src/trace_writer.cpp \
         src/perfetto_writer.cpp
 
 OBJS := $(SRCS:.cpp=.o)

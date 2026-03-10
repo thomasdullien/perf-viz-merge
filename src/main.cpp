@@ -13,7 +13,6 @@
 #include "output_writer.h"
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
-#include "trace_writer.h"
 #include "viz_json_reader.h"
 
 static void usage(const char *prog) {
@@ -23,8 +22,7 @@ static void usage(const char *prog) {
         "Options:\n"
         "  --perf <path>          Path to perf.data file\n"
         "  --viz <path>           Path to VizTracer JSON file\n"
-        "  -o, --output <path>    Output file (default: auto based on format)\n"
-        "  --format <fmt>         Output format: json (default) or perfetto\n"
+        "  -o, --output <path>    Output file (default: merged.perfetto-trace)\n"
         "  --time-offset <us>     Manual time offset in microseconds\n"
         "  --filter-pid <pid>     Only include events for this PID\n"
         "  --no-sched             Omit scheduler events\n"
@@ -39,7 +37,6 @@ int main(int argc, char *argv[]) {
     std::string perf_path;
     std::string viz_path;
     std::string output_path;
-    std::string format = "json";
     double time_offset = 0;
     bool has_time_offset = false;
     MergeEngine::Options opts;
@@ -60,12 +57,6 @@ int main(int argc, char *argv[]) {
             viz_path = next();
         } else if (arg == "-o" || arg == "--output") {
             output_path = next();
-        } else if (arg == "--format") {
-            format = next();
-            if (format != "json" && format != "perfetto") {
-                fmt::print(stderr, "Error: --format must be 'json' or 'perfetto'\n");
-                return 1;
-            }
         } else if (arg == "--time-offset") {
             time_offset = std::atof(next());
             has_time_offset = true;
@@ -95,9 +86,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Default output filename based on format
     if (output_path.empty()) {
-        output_path = (format == "perfetto") ? "merged.perfetto-trace" : "merged.json";
+        output_path = "merged.perfetto-trace";
     }
 
     // Clock aligner
@@ -205,16 +195,11 @@ int main(int argc, char *argv[]) {
 
     // Create output
     if (opts.verbose) {
-        fmt::print(stderr, "Writing {} output to {}\n", format, output_path);
+        fmt::print(stderr, "Writing Perfetto output to {}\n", output_path);
     }
 
     try {
-        std::unique_ptr<OutputWriter> writer;
-        if (format == "perfetto") {
-            writer = std::make_unique<PerfettoWriter>(output_path);
-        } else {
-            writer = std::make_unique<TraceWriter>(output_path);
-        }
+        auto writer = std::make_unique<PerfettoWriter>(output_path);
 
         MergeEngine engine(*writer, aligner, opts);
 

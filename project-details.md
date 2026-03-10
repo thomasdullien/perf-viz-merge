@@ -6,12 +6,11 @@
 - A **perf.data** binary file (scheduler events, GIL uprobes, NVIDIA/NCCL uprobes)
 - A **VizTracer JSON** file (Python function-level tracing)
 
-into a single **Perfetto protobuf trace** (preferred) or Chrome Trace Format JSON
-file, viewable in the [Perfetto UI](https://ui.perfetto.dev).
+into a single **Perfetto protobuf trace**, viewable in the [Perfetto UI](https://ui.perfetto.dev).
 
-The Perfetto native format is preferred over Chrome Trace JSON because it supports
-hierarchical track grouping — per-thread child tracks for scheduler state, GIL
-contention, and GPU activity appear nested under the main thread track.
+The Perfetto native format supports hierarchical track grouping — per-thread child
+tracks for scheduler state, GIL contention, and GPU activity appear nested under
+the main thread track.
 
 ### Key challenges solved
 - 15M+ perf events + 7M+ VizTracer events merged in under a minute
@@ -31,20 +30,16 @@ contention, and GPU activity appear nested under the main thread track.
 │  perf.data   │────▶│  PerfDataReader  │────▶│                 │
 │  (binary)    │     │  (standalone     │     │                 │
 └─────────────┘     │   parser +       │     │   MergeEngine   │──▶  output
-                     │   libtraceevent) │     │   (state machines│    (Perfetto proto
-┌─────────────┐     └──────────────────┘     │    + merge-sort) │     or Chrome JSON)
+                     │   libtraceevent) │     │   (state machines│    (.perfetto-trace)
+┌─────────────┐     └──────────────────┘     │    + merge-sort) │
 │  trace.json  │────▶┌──────────────────┐    │                 │
 │  (VizTracer) │     │  VizJsonReader   │────▶│                 │
 └─────────────┘     │  (simdjson       │     └────────┬────────┘
                      │   ondemand)      │              │
                      └──────────────────┘     ┌────────▼────────┐
-                                              │  OutputWriter   │
-                                    ┌─────────┴─────────┐      │
-                                    │                   │      │
-                              PerfettoWriter      TraceWriter   │
-                              (native proto)      (JSON)        │
-                                    └─────────┬─────────┘      │
-                                              │  ClockAligner   │
+                                              │  PerfettoWriter │
+                                              │  (native proto) │
+                                              │  + ClockAligner │
                                               └─────────────────┘
 ```
 
@@ -57,8 +52,7 @@ contention, and GPU activity appear nested under the main thread track.
 | **ClockAligner** | `clock_aligner.h` (header-only) | Auto-detects whether both sources use CLOCK_MONOTONIC (large absolute timestamps with overlapping ranges → offset=0) or different bases (align start times); supports manual `--time-offset` override |
 | **MergeEngine** | `merge_engine.h/cpp` | Merge-sorts perf and VizTracer events by timestamp; implements scheduler, GIL, and GPU state machines; emits output events via OutputWriter interface |
 | **PerfettoWriter** | `perfetto_writer.h/cpp` | Hand-coded protobuf encoder producing native Perfetto traces; manages track hierarchy (process → thread → child tracks for sched/GIL/GPU); string interning for event names and categories |
-| **TraceWriter** | `trace_writer.h/cpp` | Streaming Chrome Trace Format JSON writer using fmt::format |
-| **OutputWriter** | `output_writer.h` | Abstract interface implemented by both writers: `write_complete`, `write_begin`, `write_end`, `write_instant`, `write_metadata`, `write_viz_event`, `finalize` |
+| **OutputWriter** | `output_writer.h` | Abstract interface implemented by PerfettoWriter: `write_complete`, `write_begin`, `write_end`, `write_instant`, `write_metadata`, `write_viz_event`, `finalize` |
 
 ---
 
@@ -234,8 +228,7 @@ Usage: perf-viz-merge [options]
 Options:
   --perf <path>          Path to perf.data file
   --viz <path>           Path to VizTracer JSON file
-  -o, --output <path>    Output file (default: auto based on format)
-  --format <fmt>         Output format: json or perfetto (default: json)
+  -o, --output <path>    Output file (default: merged.perfetto-trace)
   --time-offset <us>     Manual time offset in microseconds
   --filter-pid <pid>     Only include events for this PID
   --no-sched             Omit scheduler events
@@ -289,7 +282,6 @@ perftrace/
 │   ├── merge_engine.h/cpp     # State machines, merge logic
 │   ├── output_writer.h        # Abstract output interface
 │   ├── perfetto_writer.h/cpp  # Native Perfetto protobuf output
-│   ├── trace_writer.h/cpp     # Chrome Trace JSON output
 │   ├── dump_thread_events.cpp # Diagnostic: per-thread event dump
 │   └── dump_gpu_events.cpp    # Diagnostic: GPU event analysis
 ├── scripts/
@@ -338,14 +330,10 @@ Shows which threads have GPU events and their counts:
 perf may install duplicate probes (`python:take_gil` + `python:take_gil_1`).
 All handlers are idempotent to prevent duplicate spans.
 
-### Perfetto vs Chrome Trace JSON
-Perfetto native format is preferred because:
-- Child tracks group under parent threads (sched/GIL/GPU next to call stacks)
-- String interning reduces trace file size
-- Better handling of large traces in the Perfetto UI
-
-Chrome Trace JSON is still supported but track grouping is less reliable
-(Perfetto UI sorts tracks by numeric TID, scattering synthetic tracks).
+### Output format
+Only Perfetto native protobuf format is supported. Chrome Trace JSON output was
+removed because Perfetto's track hierarchy (child tracks grouped under parent
+threads) is essential for the sched/GIL/GPU track layout.
 
 ### Memory budget
 | Data | Size |
