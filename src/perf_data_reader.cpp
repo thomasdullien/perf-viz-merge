@@ -9,7 +9,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+extern "C" {
 #include <traceevent/event-parse.h>
+}
+
 
 #include <fmt/format.h>
 

@@ -1,5 +1,5 @@
 CXX      := g++
-CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -march=native
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -march=native
 LDFLAGS  :=
 
 # libtraceevent
