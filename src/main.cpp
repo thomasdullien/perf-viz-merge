@@ -21,7 +21,7 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  --perf <path>          Path to perf.data file\n"
-        "  --viz <path>           Path to VizTracer JSON file\n"
+        "  --viz <path>           Path to VizTracer JSON file (may be repeated)\n"
         "  -o, --output <path>    Output file (default: merged.perfetto-trace)\n"
         "  --time-offset <us>     Manual time offset in microseconds\n"
         "  --filter-pid <pid>     Only include events for this PID\n"
@@ -35,7 +35,7 @@ static void usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     std::string perf_path;
-    std::string viz_path;
+    std::vector<std::string> viz_paths;
     std::string output_path;
     double time_offset = 0;
     bool has_time_offset = false;
@@ -54,7 +54,7 @@ int main(int argc, char *argv[]) {
         if (arg == "--perf") {
             perf_path = next();
         } else if (arg == "--viz") {
-            viz_path = next();
+            viz_paths.push_back(next());
         } else if (arg == "-o" || arg == "--output") {
             output_path = next();
         } else if (arg == "--time-offset") {
@@ -80,7 +80,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (perf_path.empty() && viz_path.empty()) {
+    if (perf_path.empty() && viz_paths.empty()) {
         fmt::print(stderr, "Error: at least one of --perf or --viz is required\n");
         usage(argv[0]);
         return 1;
@@ -130,7 +130,7 @@ int main(int argc, char *argv[]) {
     // Read VizTracer events
     std::vector<VizEvent> viz_events;
 
-    if (!viz_path.empty()) {
+    for (const auto &viz_path : viz_paths) {
         if (opts.verbose) {
             fmt::print(stderr, "Reading VizTracer data from {}\n", viz_path);
         }
@@ -142,10 +142,12 @@ int main(int argc, char *argv[]) {
             });
 
             if (opts.verbose) {
-                fmt::print(stderr, "Read {} VizTracer events\n", reader.event_count());
+                fmt::print(stderr, "Read {} VizTracer events from {}\n",
+                           reader.event_count(), viz_path);
             }
         } catch (const std::exception &e) {
-            fmt::print(stderr, "Error reading VizTracer data: {}\n", e.what());
+            fmt::print(stderr, "Error reading VizTracer data from {}: {}\n",
+                       viz_path, e.what());
             return 1;
         }
     }
@@ -207,7 +209,7 @@ int main(int argc, char *argv[]) {
             engine.add_perf_events(std::move(perf_events), comm_map);
         }
 
-        if (!perf_path.empty() && !viz_path.empty()) {
+        if (!perf_path.empty() && !viz_paths.empty()) {
             engine.merge_viz_events(viz_events);
         } else if (!perf_path.empty()) {
             engine.write_perf_only();
