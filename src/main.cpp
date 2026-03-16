@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -14,6 +16,46 @@
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
 #include "viz_json_reader.h"
+
+// Close any open B (begin) events left at the end of a trace file by
+// appending synthetic E (end) events.  Without this, unclosed call stacks
+// from one file bleed into the next file on the same tid.
+static void close_open_stacks(std::vector<VizEvent> &events, size_t start_idx) {
+    // Build per-tid stack of open B events (index into events vector)
+    std::unordered_map<int64_t, std::vector<size_t>> stacks;
+
+    for (size_t i = start_idx; i < events.size(); i++) {
+        const auto &e = events[i];
+        if (e.ph == 'B') {
+            stacks[e.tid].push_back(i);
+        } else if (e.ph == 'E') {
+            auto &st = stacks[e.tid];
+            if (!st.empty()) st.pop_back();
+        }
+        // X events are self-contained, no stack effect
+    }
+
+    // Find the last timestamp in this file's events
+    double last_ts = 0;
+    for (size_t i = start_idx; i < events.size(); i++) {
+        if (events[i].ts_us > last_ts) last_ts = events[i].ts_us;
+    }
+
+    // Emit synthetic E events for each unclosed B, in reverse stack order
+    for (auto &[tid, st] : stacks) {
+        for (auto it = st.rbegin(); it != st.rend(); ++it) {
+            VizEvent close;
+            close.ts_us = last_ts;
+            close.dur_us = 0;
+            close.pid = events[*it].pid;
+            close.tid = tid;
+            close.ph = 'E';
+            close.name = events[*it].name;
+            close.cat = events[*it].cat;
+            events.push_back(std::move(close));
+        }
+    }
+}
 
 static void usage(const char *prog) {
     fmt::print(stderr,
@@ -135,6 +177,7 @@ int main(int argc, char *argv[]) {
             fmt::print(stderr, "Reading VizTracer data from {}\n", viz_path);
         }
 
+        size_t before = viz_events.size();
         try {
             VizJsonReader reader(viz_path);
             reader.read_all_events([&](const VizEvent &event) {
@@ -149,6 +192,17 @@ int main(int argc, char *argv[]) {
             fmt::print(stderr, "Error reading VizTracer data from {}: {}\n",
                        viz_path, e.what());
             return 1;
+        }
+
+        // Close any call stacks left open at the end of this file
+        // so they don't bleed into the next file's events.
+        if (viz_events.size() > before) {
+            size_t before_close = viz_events.size();
+            close_open_stacks(viz_events, before);
+            if (opts.verbose && viz_events.size() > before_close) {
+                fmt::print(stderr, "  Closed {} open call stacks\n",
+                           viz_events.size() - before_close);
+            }
         }
     }
 
