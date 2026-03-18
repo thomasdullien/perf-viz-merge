@@ -28,6 +28,16 @@ public:
     using EventCallback = std::function<void(const PerfEvent &)>;
     void read_all_events(EventCallback cb);
 
+    // Pull-based iteration: call next_event() repeatedly until it returns false.
+    // This allows interleaving reads with processing (e.g., for streaming sort).
+    bool next_event(PerfEvent &out);
+
+    // Initialize the pull-based cursor (must be called before next_event).
+    void begin_iteration();
+
+    // File size accessor
+    size_t file_size() const { return mmap_size_; }
+
     // Metadata accessors
     uint64_t event_count() const { return event_count_; }
     const std::vector<std::string> &event_names() const { return attr_names_; }
@@ -55,6 +65,10 @@ private:
     std::unordered_map<int32_t, std::string> comm_map_;
 
     uint64_t event_count_ = 0;
+
+    // Pull-based iteration cursor
+    const uint8_t *cursor_ = nullptr;
+    const uint8_t *cursor_end_ = nullptr;
 
     void parse_header();
     void parse_attrs();

@@ -17,15 +17,14 @@ int32_t MergeEngine::tgid_for(int32_t tid) const {
     return it != tid_to_tgid_.end() ? it->second : tid;
 }
 
-void MergeEngine::build_tid_map(const std::vector<VizEvent> &viz_events) {
+void MergeEngine::build_tid_map(const std::vector<PerfEvent> &fork_events,
+                                const std::vector<VizEvent> &viz_events) {
     // From perf fork events: child_tid belongs to child_pid (which IS the tgid)
-    for (const auto &event : perf_events_) {
-        if (event.type == PerfEventType::SchedFork) {
-            int32_t child_pid = event.data.fork.child_pid;
-            int32_t child_tid = event.data.fork.child_tid;
-            if (child_pid > 0 && child_tid > 0) {
-                tid_to_tgid_[child_tid] = child_pid;
-            }
+    for (const auto &event : fork_events) {
+        int32_t child_pid = event.data.fork.child_pid;
+        int32_t child_tid = event.data.fork.child_tid;
+        if (child_pid > 0 && child_tid > 0) {
+            tid_to_tgid_[child_tid] = child_pid;
         }
         // The perf event header pid is the real TGID
         if (event.pid > 0 && event.tid > 0) {
@@ -43,33 +42,59 @@ void MergeEngine::build_tid_map(const std::vector<VizEvent> &viz_events) {
     }
 }
 
+void MergeEngine::set_perf_source(
+    std::unique_ptr<PerfEventIterator> iter,
+    const std::unordered_map<int32_t, std::string> &comm_map,
+    const std::vector<PerfEvent> &fork_events,
+    uint64_t last_ts_ns) {
+
+    perf_iter_ = std::move(iter);
+    comm_map_ = comm_map;
+    last_perf_ts_ns_ = last_ts_ns;
+
+    // Build tid_to_tgid_ from fork events and header pid/tid pairs
+    for (const auto &event : fork_events) {
+        int32_t child_pid = event.data.fork.child_pid;
+        int32_t child_tid = event.data.fork.child_tid;
+        if (child_pid > 0 && child_tid > 0) {
+            tid_to_tgid_[child_tid] = child_pid;
+        }
+        if (event.pid > 0 && event.tid > 0) {
+            tid_to_tgid_[event.tid] = event.pid;
+        }
+    }
+}
+
 void MergeEngine::add_perf_events(
     std::vector<PerfEvent> events,
     const std::unordered_map<int32_t, std::string> &comm_map) {
 
-    perf_events_ = std::move(events);
     comm_map_ = comm_map;
 
     // Sort by timestamp, with sched_switch last at equal timestamps.
-    // sched_stat_runtime fires from update_curr() just before sched_switch
-    // and can share the same timestamp.  If sched_switch sorts first it
-    // marks the thread off-cpu, then sched_stat_runtime immediately undoes
-    // it — corrupting the state machine.
-    std::sort(perf_events_.begin(), perf_events_.end(),
+    std::sort(events.begin(), events.end(),
               [](const PerfEvent &a, const PerfEvent &b) {
                   if (a.timestamp_ns != b.timestamp_ns)
                       return a.timestamp_ns < b.timestamp_ns;
-                  // At equal timestamps: SchedSwitch last (priority 1)
                   auto pri = [](PerfEventType t) -> int {
                       return t == PerfEventType::SchedSwitch ? 1 : 0;
                   };
                   return pri(a.type) < pri(b.type);
               });
 
+    // Collect fork events and track last timestamp
+    std::vector<PerfEvent> fork_events;
+    for (const auto &e : events) {
+        if (e.type == PerfEventType::SchedFork)
+            fork_events.push_back(e);
+        if (e.pid > 0 && e.tid > 0)
+            tid_to_tgid_[e.tid] = e.pid;
+    }
+    last_perf_ts_ns_ = events.empty() ? 0 : events.back().timestamp_ns;
+
     if (opts_.verbose) {
-        // Per-type event counts
         std::unordered_map<uint8_t, size_t> type_counts;
-        for (const auto &e : perf_events_)
+        for (const auto &e : events)
             type_counts[static_cast<uint8_t>(e.type)]++;
         auto cname = [](PerfEventType t) -> const char * {
             switch (t) {
@@ -85,12 +110,14 @@ void MergeEngine::add_perf_events(
             default:                              return "GPU/NCCL";
             }
         };
-        fmt::print(stderr, "Loaded {} perf events\n", perf_events_.size());
+        fmt::print(stderr, "Loaded {} perf events\n", events.size());
         for (const auto &[t, n] : type_counts) {
             fmt::print(stderr, "  {:20s}: {}\n",
                        cname(static_cast<PerfEventType>(t)), n);
         }
     }
+
+    perf_iter_ = std::make_unique<VectorPerfIterator>(std::move(events));
 }
 
 // Clean up VizTracer THREAD_MAP instant event names.
@@ -154,12 +181,12 @@ void MergeEngine::write_metadata() {
             pid_names[tgid] = name;
         }
     }
-    // Also derive process names from perf events
-    for (const auto &event : perf_events_) {
-        if (event.pid > 0 && pid_names.find(event.pid) == pid_names.end()) {
-            auto it = comm_map_.find(event.pid);
+    // Also derive process names from tid_to_tgid_ map
+    for (const auto &[tid, tgid] : tid_to_tgid_) {
+        if (tgid > 0 && pid_names.find(tgid) == pid_names.end()) {
+            auto it = comm_map_.find(tgid);
             if (it != comm_map_.end()) {
-                pid_names[event.pid] = it->second;
+                pid_names[tgid] = it->second;
             }
         }
     }
@@ -638,11 +665,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 void MergeEngine::flush_sched_state() {
     if (!opts_.include_sched) return;
 
-    // Find the last perf event timestamp to close open spans
-    uint64_t last_ts_ns = 0;
-    if (!perf_events_.empty()) {
-        last_ts_ns = perf_events_.back().timestamp_ns;
-    }
+    uint64_t last_ts_ns = last_perf_ts_ns_;
     if (last_ts_ns == 0) return;
 
     for (const auto &[tid, state] : sched_state_) {
@@ -673,30 +696,31 @@ void MergeEngine::flush_sched_state() {
 }
 
 void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
-    build_tid_map(viz_events);
+    // Build tid map from fork events collected during read + viz events
+    std::vector<PerfEvent> empty_forks; // fork events already loaded in set_perf_source
+    build_tid_map(empty_forks, viz_events);
     write_metadata();
 
     // Two-pointer merge of time-sorted perf events and viz events
-    size_t pi = 0; // perf index
     size_t vi = 0; // viz index
 
-    while (pi < perf_events_.size() || vi < viz_events.size()) {
+    while ((perf_iter_ && perf_iter_->has_next()) || vi < viz_events.size()) {
         bool emit_perf = false;
 
-        if (pi >= perf_events_.size()) {
+        if (!perf_iter_ || !perf_iter_->has_next()) {
             emit_perf = false; // Only viz left
         } else if (vi >= viz_events.size()) {
             emit_perf = true; // Only perf left
         } else {
             // Compare timestamps (convert both to microseconds)
-            double perf_us = aligner_.align_perf(perf_events_[pi].timestamp_ns);
+            double perf_us = aligner_.align_perf(perf_iter_->peek().timestamp_ns);
             double viz_us = aligner_.align_viz(viz_events[vi].ts_us);
             emit_perf = (perf_us <= viz_us);
         }
 
         if (emit_perf) {
-            emit_perf_event(perf_events_[pi]);
-            pi++;
+            emit_perf_event(perf_iter_->peek());
+            perf_iter_->advance();
         } else {
             const VizEvent &ve = viz_events[vi];
             double ts = aligner_.align_viz(ve.ts_us);
@@ -752,10 +776,15 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
 }
 
 void MergeEngine::write_perf_only() {
-    build_tid_map({});
+    std::vector<PerfEvent> empty_forks;
+    std::vector<VizEvent> empty_viz;
+    build_tid_map(empty_forks, empty_viz);
     write_metadata();
-    for (const auto &event : perf_events_) {
-        emit_perf_event(event);
+    if (perf_iter_) {
+        while (perf_iter_->has_next()) {
+            emit_perf_event(perf_iter_->peek());
+            perf_iter_->advance();
+        }
     }
     flush_sched_state();
     if (opts_.verbose) {

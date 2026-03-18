@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 // Unified event representation used by the merge engine.
 // Both perf events and VizTracer events are converted to this format.
@@ -91,6 +92,9 @@ struct PerfEvent {
     PerfEvent() : timestamp_ns(0), pid(0), tid(0), cpu(0),
                   type(PerfEventType::Other), data{} {}
 };
+
+static_assert(std::is_trivially_copyable_v<PerfEvent>,
+              "PerfEvent must be trivially copyable for streaming sort");
 
 // A VizTracer event, yielded one at a time from the JSON stream.
 struct VizEvent {

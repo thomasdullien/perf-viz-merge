@@ -15,6 +15,7 @@
 #include "output_writer.h"
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
+#include "streaming_sort.h"
 #include "viz_json_reader.h"
 
 // Close any open B (begin) events left at the end of a trace file by
@@ -139,8 +140,15 @@ int main(int argc, char *argv[]) {
     }
 
     // Read perf events
-    std::vector<PerfEvent> perf_events;
+    std::unique_ptr<PerfEventIterator> perf_iter;
+    std::vector<PerfEvent> fork_events;
     std::unordered_map<int32_t, std::string> comm_map;
+    uint64_t perf_min_ts = 0, perf_max_ts = 0;
+    uint64_t perf_event_count = 0;
+    bool has_perf = false;
+
+    static constexpr size_t STREAMING_THRESHOLD = 8ULL * 1024 * 1024 * 1024;  // 8GB
+    static constexpr size_t REORDER_BUFFER_SIZE = 1'000'000;  // ~88MB
 
     if (!perf_path.empty()) {
         if (opts.verbose) {
@@ -148,20 +156,77 @@ int main(int argc, char *argv[]) {
         }
 
         try {
-            PerfDataReader reader(perf_path);
-            reader.read_all_events([&](const PerfEvent &event) {
-                perf_events.push_back(event);
-            });
-            comm_map = reader.comm_map();
+            auto reader = std::make_unique<PerfDataReader>(perf_path);
+            size_t file_size = reader->file_size();
+            comm_map = reader->comm_map();
 
             if (opts.verbose) {
-                fmt::print(stderr, "Read {} perf events ({} event types)\n",
-                           reader.event_count(), reader.event_names().size());
-                for (size_t i = 0; i < reader.event_names().size(); i++) {
-                    if (!reader.event_names()[i].empty()) {
-                        fmt::print(stderr, "  Event {}: {}\n", i, reader.event_names()[i]);
+                fmt::print(stderr, "Perf file size: {:.1f} GB ({} event types)\n",
+                           file_size / (1024.0 * 1024.0 * 1024.0),
+                           reader->event_names().size());
+                for (size_t i = 0; i < reader->event_names().size(); i++) {
+                    if (!reader->event_names()[i].empty()) {
+                        fmt::print(stderr, "  Event {}: {}\n", i, reader->event_names()[i]);
                     }
                 }
+            }
+
+            if (file_size < STREAMING_THRESHOLD) {
+                // Small-file fast path: load all events, sort in-memory
+                if (opts.verbose) {
+                    fmt::print(stderr, "Using in-memory sort (file < 8GB)\n");
+                }
+                std::vector<PerfEvent> perf_events;
+                reader->read_all_events([&](const PerfEvent &event) {
+                    perf_events.push_back(event);
+                    if (event.type == PerfEventType::SchedFork)
+                        fork_events.push_back(event);
+                });
+                comm_map = reader->comm_map();
+                perf_event_count = perf_events.size();
+
+                // Sort with SchedSwitch-last tiebreaker
+                std::sort(perf_events.begin(), perf_events.end(),
+                          [](const PerfEvent &a, const PerfEvent &b) {
+                              if (a.timestamp_ns != b.timestamp_ns)
+                                  return a.timestamp_ns < b.timestamp_ns;
+                              auto pri = [](PerfEventType t) -> int {
+                                  return t == PerfEventType::SchedSwitch ? 1 : 0;
+                              };
+                              return pri(a.type) < pri(b.type);
+                          });
+
+                if (!perf_events.empty()) {
+                    perf_min_ts = perf_events.front().timestamp_ns;
+                    perf_max_ts = perf_events.back().timestamp_ns;
+                }
+
+                perf_iter = std::make_unique<VectorPerfIterator>(std::move(perf_events));
+            } else {
+                // Large-file path: streaming reorder buffer
+                if (opts.verbose) {
+                    fmt::print(stderr, "Using streaming reorder buffer "
+                               "(file >= 8GB, buffer = {} events = {:.0f}MB)\n",
+                               REORDER_BUFFER_SIZE,
+                               REORDER_BUFFER_SIZE * sizeof(PerfEvent) / (1024.0 * 1024.0));
+                }
+                auto reorder = std::make_unique<ReorderBufferIterator>(
+                    std::move(reader), REORDER_BUFFER_SIZE);
+
+                fork_events = reorder->fork_events();
+                perf_min_ts = reorder->min_timestamp_ns();
+                perf_max_ts = reorder->max_timestamp_ns();
+                // Note: total_events() reflects the initial fill count;
+                // the full count is only known after iteration completes.
+                perf_event_count = reorder->total_events();
+                // comm_map already captured above before reader was moved
+                perf_iter = std::move(reorder);
+            }
+
+            has_perf = true;
+
+            if (opts.verbose) {
+                fmt::print(stderr, "Read {} perf events\n", perf_event_count);
             }
         } catch (const std::exception &e) {
             fmt::print(stderr, "Error reading perf data: {}\n", e.what());
@@ -207,13 +272,9 @@ int main(int argc, char *argv[]) {
     }
 
     // Auto-detect clock alignment if both sources are present
-    if (!perf_events.empty() && !viz_events.empty() && !has_time_offset) {
-        uint64_t perf_first = perf_events.front().timestamp_ns;
-        uint64_t perf_last = perf_events.front().timestamp_ns;
-        for (const auto &e : perf_events) {
-            if (e.timestamp_ns < perf_first) perf_first = e.timestamp_ns;
-            if (e.timestamp_ns > perf_last) perf_last = e.timestamp_ns;
-        }
+    if (has_perf && !viz_events.empty() && !has_time_offset) {
+        uint64_t perf_first = perf_min_ts;
+        uint64_t perf_last = perf_max_ts;
 
         double viz_first = viz_events.front().ts_us;
         double viz_last = viz_events.front().ts_us;
@@ -259,13 +320,14 @@ int main(int argc, char *argv[]) {
 
         MergeEngine engine(*writer, aligner, opts);
 
-        if (!perf_events.empty()) {
-            engine.add_perf_events(std::move(perf_events), comm_map);
+        if (perf_iter) {
+            engine.set_perf_source(std::move(perf_iter), comm_map,
+                                   fork_events, perf_max_ts);
         }
 
-        if (!perf_path.empty() && !viz_paths.empty()) {
+        if (has_perf && !viz_paths.empty()) {
             engine.merge_viz_events(viz_events);
-        } else if (!perf_path.empty()) {
+        } else if (has_perf) {
             engine.write_perf_only();
         } else {
             engine.write_viz_only(viz_events);

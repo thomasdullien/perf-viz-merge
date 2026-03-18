@@ -771,3 +771,54 @@ void PerfDataReader::parse_data_section(EventCallback &cb) {
 void PerfDataReader::read_all_events(EventCallback cb) {
     parse_data_section(cb);
 }
+
+void PerfDataReader::begin_iteration() {
+    cursor_ = mmap_base_ + header_.data.offset;
+    cursor_end_ = cursor_ + header_.data.size;
+}
+
+bool PerfDataReader::next_event(PerfEvent &out) {
+    using namespace perf_format;
+
+    while (cursor_ + sizeof(EventHeader) <= cursor_end_) {
+        EventHeader hdr;
+        std::memcpy(&hdr, cursor_, sizeof(EventHeader));
+
+        if (hdr.size < sizeof(EventHeader) || cursor_ + hdr.size > cursor_end_) {
+            return false; // Invalid or truncated record
+        }
+
+        const uint8_t *payload = cursor_ + sizeof(EventHeader);
+        size_t payload_size = hdr.size - sizeof(EventHeader);
+        cursor_ += hdr.size;
+
+        switch (hdr.type) {
+        case PERF_RECORD_SAMPLE: {
+            // Need to pass the record start (cursor before advance) for find_attr_index
+            const uint8_t *record_start = cursor_ - hdr.size;
+            size_t attr_idx = find_attr_index(record_start, hdr.size);
+            if (attr_idx < attrs_.size()) {
+                out.type = classify_event(attr_idx);
+                if (decode_sample(payload, payload_size, attrs_[attr_idx], out)) {
+                    event_count_++;
+                    return true;
+                }
+            }
+            break;
+        }
+        case PERF_RECORD_COMM:
+            decode_comm(payload, payload_size);
+            break;
+        case PERF_RECORD_FORK: {
+            if (decode_fork(payload, payload_size, out)) {
+                event_count_++;
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return false; // No more events
+}

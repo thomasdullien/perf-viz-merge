@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -8,13 +9,14 @@
 #include "clock_aligner.h"
 #include "event_types.h"
 #include "output_writer.h"
+#include "streaming_sort.h"
 
 // Merges perf events and VizTracer events into a single trace output.
 //
 // Strategy:
-// 1. Read all perf events into memory (sorted by timestamp)
+// 1. Accept a PerfEventIterator that yields events in sorted order
 // 2. Build scheduler and GIL state machines to compute durations
-// 3. Stream VizTracer events and merge-sort with perf events
+// 3. Two-pointer merge with sorted VizTracer events
 // 4. Write output incrementally
 
 struct MergeOptions {
@@ -31,7 +33,13 @@ public:
 
     MergeEngine(OutputWriter &writer, ClockAligner &aligner, Options opts = Options{});
 
-    // Add perf events (call before merge)
+    // Set the perf event source (iterator-based, streaming)
+    void set_perf_source(std::unique_ptr<PerfEventIterator> iter,
+                         const std::unordered_map<int32_t, std::string> &comm_map,
+                         const std::vector<PerfEvent> &fork_events,
+                         uint64_t last_ts_ns);
+
+    // Legacy: load all perf events into memory (small-file path)
     void add_perf_events(std::vector<PerfEvent> events,
                          const std::unordered_map<int32_t, std::string> &comm_map);
 
@@ -52,10 +60,13 @@ private:
     ClockAligner &aligner_;
     Options opts_;
 
-    std::vector<PerfEvent> perf_events_;
+    std::unique_ptr<PerfEventIterator> perf_iter_;
     std::unordered_map<int32_t, std::string> comm_map_;
     // TID → process TGID mapping (built from fork events and perf headers)
     std::unordered_map<int32_t, int32_t> tid_to_tgid_;
+
+    // Last perf timestamp for flushing open spans at end
+    uint64_t last_perf_ts_ns_ = 0;
 
     // Synthetic TID offsets for separate tracks
     static constexpr int64_t GIL_TID_OFFSET   = 100000000;
@@ -107,6 +118,7 @@ private:
     // Look up the process TGID for a TID (falls back to tid itself)
     int32_t tgid_for(int32_t tid) const;
 
-    // Build tid_to_tgid_ map from fork events and perf event headers
-    void build_tid_map(const std::vector<VizEvent> &viz_events);
+    // Build tid_to_tgid_ map from fork events and viz events
+    void build_tid_map(const std::vector<PerfEvent> &fork_events,
+                       const std::vector<VizEvent> &viz_events);
 };
