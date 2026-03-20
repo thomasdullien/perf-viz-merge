@@ -19,8 +19,15 @@ LDFLAGS  += -lelf -ldw
 SRCS := src/main.cpp \
         src/perf_data_reader.cpp \
         src/viz_json_reader.cpp \
+        src/ftrc_reader.cpp \
         src/merge_engine.cpp \
         src/perfetto_writer.cpp
+
+# libftrc (C library from pyfasttrace)
+LIBFTRC_OBJ := src/libftrc.o
+
+src/libftrc.o: src/libftrc.c src/libftrc.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -c -o $@ $<
 
 OBJS := $(SRCS:.cpp=.o)
 DEPS := $(OBJS:.o=.d)
@@ -52,7 +59,7 @@ STATIC_OBJS := $(SRCS:src/%.cpp=build-static/%.o) build-static/simdjson.o
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(LIBFTRC_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 src/%.o: src/%.cpp
@@ -90,7 +97,7 @@ $(STATIC_TARGET): $(STATIC_OBJS)
 	@echo "Verify: ldd $(STATIC_TARGET) should say 'not a dynamic executable'"
 
 clean:
-	rm -f $(OBJS) $(DEPS) $(TARGET) $(STATIC_TARGET)
+	rm -f $(OBJS) $(DEPS) $(LIBFTRC_OBJ) $(TARGET) $(STATIC_TARGET)
 	rm -rf test/output build-static
 
 distclean: clean
