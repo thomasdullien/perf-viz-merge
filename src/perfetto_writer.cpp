@@ -31,14 +31,22 @@ void PerfettoWriter::write_packet(const std::string &packet_data) {
 }
 
 uint64_t PerfettoWriter::track_uuid_for(int64_t pid, int64_t tid) {
-    if (tid >= GPU_TID_OFFSET) {
+    // Synthetic TIDs from the merge engine are in range [offset, offset + MAX_REAL_TID).
+    // Real Linux TIDs are < ~4M.  Python pthread_t TIDs can be huge (48-bit
+    // addresses like 131841036036992) and must NOT be treated as synthetic.
+    static constexpr int64_t MAX_REAL_TID = 10000000;  // 10M
+    static constexpr int64_t GPU_RANGE_END = GPU_TID_OFFSET + MAX_REAL_TID;
+    static constexpr int64_t SCHED_RANGE_END = SCHED_TID_OFFSET + MAX_REAL_TID;
+    static constexpr int64_t GIL_RANGE_END = GIL_TID_OFFSET + MAX_REAL_TID;
+
+    if (tid >= GPU_TID_OFFSET && tid < GPU_RANGE_END) {
         // GPU child track: uuid = 400000000 + real_tid
         int64_t real_tid = tid - GPU_TID_OFFSET;
         return 400000000ULL + static_cast<uint64_t>(real_tid);
-    } else if (tid >= SCHED_TID_OFFSET) {
+    } else if (tid >= SCHED_TID_OFFSET && tid < SCHED_RANGE_END) {
         // Sched child track: uuid = 200000000 + real_tid
         return static_cast<uint64_t>(tid);  // tid already = real_tid + 200000000
-    } else if (tid >= GIL_TID_OFFSET) {
+    } else if (tid >= GIL_TID_OFFSET && tid < GIL_RANGE_END) {
         // GIL child track: uuid = 300000000 + real_tid
         // tid = real_tid + 100000000, we want 300000000 + real_tid
         return static_cast<uint64_t>(tid) + 200000000ULL;
@@ -53,7 +61,13 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
     if (defined_tracks_.count(uuid)) return;
     defined_tracks_.insert(uuid);
 
-    if (tid >= GPU_TID_OFFSET) {
+    // Use same range checks as track_uuid_for
+    static constexpr int64_t MAX_REAL_TID = 10000000;
+    static constexpr int64_t GPU_RANGE_END = GPU_TID_OFFSET + MAX_REAL_TID;
+    static constexpr int64_t SCHED_RANGE_END = SCHED_TID_OFFSET + MAX_REAL_TID;
+    static constexpr int64_t GIL_RANGE_END = GIL_TID_OFFSET + MAX_REAL_TID;
+
+    if (tid >= GPU_TID_OFFSET && tid < GPU_RANGE_END) {
         int64_t real_tid = tid - GPU_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
         if (!defined_tracks_.count(parent_uuid)) {
@@ -61,7 +75,7 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
             emit_thread_track(pid, real_tid, "");
         }
         emit_child_track(uuid, parent_uuid, "GPU", 3);
-    } else if (tid >= SCHED_TID_OFFSET) {
+    } else if (tid >= SCHED_TID_OFFSET && tid < SCHED_RANGE_END) {
         int64_t real_tid = tid - SCHED_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
         if (!defined_tracks_.count(parent_uuid)) {
@@ -69,7 +83,7 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
             emit_thread_track(pid, real_tid, "");
         }
         emit_child_track(uuid, parent_uuid, "sched", 0);
-    } else if (tid >= GIL_TID_OFFSET) {
+    } else if (tid >= GIL_TID_OFFSET && tid < GIL_RANGE_END) {
         int64_t real_tid = tid - GIL_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
         if (!defined_tracks_.count(parent_uuid)) {

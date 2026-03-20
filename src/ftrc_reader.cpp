@@ -25,7 +25,7 @@ void FtrcReader::read_all_events(EventCallback cb) {
 
         if (ev.type == FTRC_EVENT_METADATA) {
             ve.ph = 'M';
-            ve.ts_us = 0;
+            ve.ts_us = ev.ts_us;
             ve.dur_us = 0;
             ve.name = "thread_name";
             ve.args_json = fmt::format(R"({{"name":"{}"}})",

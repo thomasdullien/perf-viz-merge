@@ -11,6 +11,7 @@
 
 #include "clock_aligner.h"
 #include "event_types.h"
+#include "ftrc_reader.h"
 #include "merge_engine.h"
 #include "output_writer.h"
 #include "perf_data_reader.h"
@@ -239,22 +240,36 @@ int main(int argc, char *argv[]) {
 
     for (const auto &viz_path : viz_paths) {
         if (opts.verbose) {
-            fmt::print(stderr, "Reading VizTracer data from {}\n", viz_path);
+            fmt::print(stderr, "Reading trace data from {}\n", viz_path);
         }
 
         size_t before = viz_events.size();
         try {
-            VizJsonReader reader(viz_path);
-            reader.read_all_events([&](const VizEvent &event) {
-                viz_events.push_back(event);
-            });
+            // Detect file type by extension
+            bool is_ftrc = viz_path.size() >= 5 &&
+                           viz_path.substr(viz_path.size() - 5) == ".ftrc";
 
-            if (opts.verbose) {
-                fmt::print(stderr, "Read {} VizTracer events from {}\n",
-                           reader.event_count(), viz_path);
+            if (is_ftrc) {
+                FtrcReader reader(viz_path);
+                reader.read_all_events([&](const VizEvent &event) {
+                    viz_events.push_back(event);
+                });
+                if (opts.verbose) {
+                    fmt::print(stderr, "Read {} events from {} (ftrc)\n",
+                               reader.event_count(), viz_path);
+                }
+            } else {
+                VizJsonReader reader(viz_path);
+                reader.read_all_events([&](const VizEvent &event) {
+                    viz_events.push_back(event);
+                });
+                if (opts.verbose) {
+                    fmt::print(stderr, "Read {} events from {} (json)\n",
+                               reader.event_count(), viz_path);
+                }
             }
         } catch (const std::exception &e) {
-            fmt::print(stderr, "Error reading VizTracer data from {}: {}\n",
+            fmt::print(stderr, "Error reading trace data from {}: {}\n",
                        viz_path, e.what());
             return 1;
         }

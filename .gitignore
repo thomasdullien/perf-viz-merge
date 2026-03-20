@@ -10,3 +10,6 @@ vendor/
 
 # Test output
 test/output/
+data-test/
+merged.perfetto-trace
+*.perfetto-trace
