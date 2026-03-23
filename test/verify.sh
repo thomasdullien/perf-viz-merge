@@ -2,10 +2,11 @@
 #
 # End-to-end test for perf-viz-merge.
 #
-# Usage: ./test/verify.sh [--synthetic] [--with-perf]
+# Usage: ./test/verify.sh [--synthetic] [--with-perf] [--binary <path>]
 #
 # --synthetic: Use synthetic test data only (default, no special privileges needed)
 # --with-perf: Try to use real perf record (requires root or perf_event_paranoid=-1)
+# --binary:    Path to perf-viz-merge binary (default: ./perf-viz-merge)
 
 set -euo pipefail
 
@@ -13,6 +14,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_OUTPUT_DIR="${PROJECT_DIR}/test/output"
 BINARY="${PROJECT_DIR}/perf-viz-merge"
+
+# Parse --binary flag
+args=()
+for arg in "$@"; do
+    if [[ "${prev_arg:-}" == "--binary" ]]; then
+        BINARY="$arg"
+        prev_arg=""
+        continue
+    fi
+    if [[ "$arg" == "--binary" ]]; then
+        prev_arg="$arg"
+        continue
+    fi
+    args+=("$arg")
+done
+set -- "${args[@]+${args[@]}}"
 
 # Colors for output
 RED='\033[0;31m'

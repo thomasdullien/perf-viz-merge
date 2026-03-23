@@ -55,7 +55,26 @@ STATIC_LDFLAGS  := -static -lpthread
 
 STATIC_OBJS := $(SRCS:src/%.cpp=build-static/%.o) build-static/simdjson.o
 
-.PHONY: all clean test static
+# --- ASAN build ---
+ASAN_DIR     := build-asan
+ASAN_FLAGS   := -O1 -g -fsanitize=address -fno-omit-frame-pointer
+ASAN_TARGET  := $(ASAN_DIR)/perf-viz-merge
+ASAN_OBJS    := $(SRCS:src/%.cpp=$(ASAN_DIR)/%.o)
+ASAN_LIBFTRC := $(ASAN_DIR)/libftrc.o
+
+$(ASAN_DIR)/%.o: src/%.cpp
+	@mkdir -p $(ASAN_DIR)
+	$(CXX) $(CXXFLAGS) $(ASAN_FLAGS) -MMD -MP -c -o $@ $<
+
+$(ASAN_LIBFTRC): src/libftrc.c src/libftrc.h
+	@mkdir -p $(ASAN_DIR)
+	$(CC) -std=c11 $(ASAN_FLAGS) -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -c -o $@ $<
+
+$(ASAN_TARGET): $(ASAN_OBJS) $(ASAN_LIBFTRC)
+	$(CXX) $(CXXFLAGS) $(ASAN_FLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "ASAN binary built: $(ASAN_TARGET)"
+
+.PHONY: all clean test static asan test-asan
 
 all: $(TARGET)
 
@@ -96,9 +115,14 @@ $(STATIC_TARGET): $(STATIC_OBJS)
 	@echo "Static binary built: $(STATIC_TARGET) ($$(du -h $(STATIC_TARGET) | cut -f1))"
 	@echo "Verify: ldd $(STATIC_TARGET) should say 'not a dynamic executable'"
 
+asan: $(ASAN_TARGET)
+
+test-asan: $(ASAN_TARGET)
+	ASAN_OPTIONS=detect_leaks=0 ./test/verify.sh --synthetic --binary $(ASAN_TARGET)
+
 clean:
 	rm -f $(OBJS) $(DEPS) $(LIBFTRC_OBJ) $(TARGET) $(STATIC_TARGET)
-	rm -rf test/output build-static
+	rm -rf test/output build-static build-asan
 
 distclean: clean
 	rm -rf $(VENDOR_DIR)
