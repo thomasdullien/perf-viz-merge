@@ -1,8 +1,11 @@
 # perf-viz-merge
 
-A C++17 tool that merges Linux `perf.data` recordings and
-[VizTracer](https://github.com/gaogaotiantian/viztracer) Python traces into a
-single [Perfetto](https://ui.perfetto.dev) trace file.
+A C++17 tool that merges Linux `perf.data` recordings and Python function
+traces into a single [Perfetto](https://ui.perfetto.dev) trace file.
+
+Supports both [VizTracer](https://github.com/gaogaotiantian/viztracer) JSON
+files and [fasttracer](https://github.com/thomasdullien/pyfasttrace) `.ftrc`
+binary files as trace input (auto-detected by file extension).
 
 The merged trace shows **Python call stacks**, **scheduler state** (on-cpu /
 off-cpu per thread), **GIL contention** (acquire wait vs. held), and
@@ -87,9 +90,23 @@ sudo perf record \
     -- python my_script.py
 ```
 
-#### 3. Record VizTracer data
+#### 3. Record Python trace data
 
-In a separate terminal (or as part of your script), run VizTracer:
+In a separate terminal (or as part of your script), record a Python trace using
+either **fasttracer** (recommended — low overhead, binary `.ftrc` format) or
+**VizTracer** (JSON format).
+
+**fasttracer** (produces `.ftrc` files, read directly by the merge tool):
+
+```python
+from fasttracer import FastTracer
+
+with FastTracer(output_dir="/tmp/traces"):
+    main()
+# Output: /tmp/traces/<pid>.ftrc
+```
+
+**VizTracer** (produces JSON files):
 
 ```bash
 viztracer --tracer_entries 20000000 -o trace.json my_script.py
@@ -107,6 +124,16 @@ with VizTracer(tracer_entries=20000000, output_file="trace.json"):
 ### Merge
 
 ```bash
+# With fasttracer .ftrc files (can pass multiple --viz flags)
+./perf-viz-merge \
+    --perf perf.data \
+    --viz /tmp/traces/12345.ftrc \
+    --viz /tmp/traces/12346.ftrc \
+    --filter-pid <PID> \
+    -o merged.perfetto-trace \
+    -v
+
+# With VizTracer JSON
 ./perf-viz-merge \
     --perf perf.data \
     --viz trace.json \
@@ -114,6 +141,10 @@ with VizTracer(tracer_entries=20000000, output_file="trace.json"):
     -o merged.perfetto-trace \
     -v
 ```
+
+The `--viz` flag auto-detects the file format by extension (`.ftrc` for
+fasttracer binary, anything else for VizTracer JSON). Multiple `--viz` flags
+can be used to merge traces from several processes.
 
 Open `merged.perfetto-trace` in the [Perfetto UI](https://ui.perfetto.dev).
 
@@ -124,7 +155,7 @@ Usage: perf-viz-merge [options]
 
 Options:
   --perf <path>          Path to perf.data file
-  --viz <path>           Path to VizTracer JSON file
+  --viz <path>           Path to trace file (.ftrc or JSON, may be repeated)
   -o, --output <path>    Output file (default: merged.perfetto-trace)
   --time-offset <us>     Manual time offset in microseconds
   --filter-pid <pid>     Only include events for this PID
@@ -146,7 +177,7 @@ Each thread gets up to four child tracks, grouped together:
 |-------|---------|
 | **sched** | on-cpu / off-cpu spans with sleep reason (S/D/T/etc.) |
 | **GIL** | "GIL acquire" (waiting) and "GIL held" spans |
-| **call stacks** | VizTracer Python function spans |
+| **call stacks** | Python function spans (from fasttracer or VizTracer) |
 | **GPU** | CUDA and NCCL API call spans (launch, sync, memcpy, allreduce, ...) |
 
 ## How it works
@@ -154,8 +185,9 @@ Each thread gets up to four child tracks, grouped together:
 - **perf.data parsing**: Standalone binary parser (no dependency on `perf
   script` or kernel headers). Decodes `sample_type` bitmasks, parses raw
   tracepoint data for `sched_switch`, `sched_wakeup`, and `sched_process_fork`.
-- **VizTracer parsing**: Streams JSON via simdjson's ondemand API (memory-mapped,
-  handles multi-GB files).
+- **Trace parsing**: Reads fasttracer `.ftrc` binary files natively (via
+  `libftrc`) and VizTracer JSON via simdjson's ondemand API (memory-mapped,
+  handles multi-GB files). Format is auto-detected by file extension.
 - **Clock alignment**: Auto-detects that both sources use `CLOCK_MONOTONIC` when
   timestamps are large absolute values with overlapping ranges. Falls back to
   start-time alignment otherwise.
