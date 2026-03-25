@@ -26,6 +26,7 @@ struct MergeOptions {
     bool verbose = false;
     int32_t filter_pid = -1;  // -1 = no filter
     double min_duration_us = 0;  // skip viz events shorter than this (0 = keep all)
+    std::vector<std::string> filter_names;  // empty = no filter; substring match, OR'd
 };
 
 class MergeEngine {
@@ -120,10 +121,20 @@ private:
     // Check if event passes PID filter
     bool passes_filter(int32_t pid) const;
 
+    // Check if a thread/process passes the name filter (substring match, OR'd)
+    bool passes_name_filter(int32_t tid) const;
+
     // Look up the process TGID for a TID (falls back to tid itself)
     int32_t tgid_for(int32_t tid) const;
 
     // Build tid_to_tgid_ map from fork events and viz events
     void build_tid_map(const std::vector<PerfEvent> &fork_events,
                        const std::vector<VizEvent> &viz_events);
+
+    // Build name map from viz metadata events (thread_name / process_name)
+    void build_viz_name_map(const std::vector<VizEvent> &viz_events);
+
+    // Map from tid -> thread/process name (from viz metadata)
+    std::unordered_map<int64_t, std::string> viz_name_map_;
+
 };

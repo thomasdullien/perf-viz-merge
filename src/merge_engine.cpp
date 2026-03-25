@@ -12,6 +12,78 @@ bool MergeEngine::passes_filter(int32_t pid) const {
     return opts_.filter_pid < 0 || pid == opts_.filter_pid;
 }
 
+bool MergeEngine::passes_name_filter(int32_t tid) const {
+    if (opts_.filter_names.empty()) return true;
+
+    // Check comm_map_ (perf thread names)
+    auto comm_it = comm_map_.find(tid);
+    if (comm_it != comm_map_.end()) {
+        for (const auto &pattern : opts_.filter_names) {
+            if (comm_it->second.find(pattern) != std::string::npos)
+                return true;
+        }
+    }
+
+    // Check viz_name_map_ (viz/ftrc metadata thread names)
+    auto viz_it = viz_name_map_.find(static_cast<int64_t>(tid));
+    if (viz_it != viz_name_map_.end()) {
+        for (const auto &pattern : opts_.filter_names) {
+            if (viz_it->second.find(pattern) != std::string::npos)
+                return true;
+        }
+    }
+
+    // Also check by TGID (process-level name match)
+    int32_t tgid = tgid_for(tid);
+    if (tgid != tid) {
+        auto comm_tgid = comm_map_.find(tgid);
+        if (comm_tgid != comm_map_.end()) {
+            for (const auto &pattern : opts_.filter_names) {
+                if (comm_tgid->second.find(pattern) != std::string::npos)
+                    return true;
+            }
+        }
+        auto viz_tgid = viz_name_map_.find(static_cast<int64_t>(tgid));
+        if (viz_tgid != viz_name_map_.end()) {
+            for (const auto &pattern : opts_.filter_names) {
+                if (viz_tgid->second.find(pattern) != std::string::npos)
+                    return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+
+void MergeEngine::build_viz_name_map(const std::vector<VizEvent> &viz_events) {
+    for (const auto &ve : viz_events) {
+        if (ve.ph != 'M') continue;
+        if (ve.name != "thread_name" && ve.name != "process_name") continue;
+
+        // Extract name from args_json: {"name":"..."}
+        auto pos = ve.args_json.find("\"name\":\"");
+        if (pos == std::string::npos) continue;
+        pos += 8; // skip past "name":"
+        auto end = ve.args_json.find('"', pos);
+        if (end == std::string::npos) continue;
+
+        std::string name = ve.args_json.substr(pos, end - pos);
+        viz_name_map_[ve.tid] = name;
+        // Also map pid for process_name
+        if (ve.name == "process_name") {
+            viz_name_map_[ve.pid] = name;
+        }
+    }
+    if (opts_.verbose && !viz_name_map_.empty()) {
+        fmt::print(stderr, "Built viz name map with {} entries\n", viz_name_map_.size());
+        for (const auto &[id, name] : viz_name_map_) {
+            fmt::print(stderr, "  tid/pid {} -> \"{}\"\n", id, name);
+        }
+    }
+}
+
+
 int32_t MergeEngine::tgid_for(int32_t tid) const {
     auto it = tid_to_tgid_.find(tid);
     return it != tid_to_tgid_.end() ? it->second : tid;
@@ -295,7 +367,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         int64_t sched_next_tid = static_cast<int64_t>(next_tid) + SCHED_TID_OFFSET;
 
         // prev_tid is being switched OUT
-        if (passes_filter(prev_tgid)) {
+        if (passes_filter(prev_tgid) && passes_name_filter(prev_tid)) {
             auto it = sched_state_.find(prev_tid);
             if (it != sched_state_.end() && it->second.on_cpu) {
                 // Close on-CPU span: from last_event_ns to now
@@ -323,7 +395,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         // Only process if next_tid is a known thread of our process.
         // With per-process recording, next_tid is often an external
         // thread — skip those to avoid phantom sched entries.
-        if (passes_filter(next_tgid) && tid_to_tgid_.count(next_tid)) {
+        if (passes_filter(next_tgid) && passes_name_filter(next_tid) && tid_to_tgid_.count(next_tid)) {
             auto it = sched_state_.find(next_tid);
             if (it != sched_state_.end() && !it->second.on_cpu) {
                 // Close off-CPU span: from last_event_ns to now
@@ -356,7 +428,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         int32_t target_tid = event.data.wakeup.target_tid;
         if (target_tid == 0) break;  // unparsed wakeup
         int32_t target_tgid = tgid_for(target_tid);
-        if (!passes_filter(target_tgid)) return;
+        if (!passes_filter(target_tgid) || !passes_name_filter(target_tid)) return;
 
         int64_t sched_tid = static_cast<int64_t>(target_tid) + SCHED_TID_OFFSET;
 
@@ -396,7 +468,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     case PerfEventType::SchedFork: {
         if (!opts_.include_sched) return;
         int32_t tgid = tgid_for(event.tid);
-        if (!passes_filter(tgid)) return;
+        if (!passes_filter(tgid) || !passes_name_filter(event.tid)) return;
 
         int64_t sched_tid = static_cast<int64_t>(event.tid) + SCHED_TID_OFFSET;
         std::string args = fmt::format(
@@ -411,7 +483,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
     case PerfEventType::TakeGil: {
         if (!opts_.include_gil) return;
-        if (!passes_filter(event.pid)) return;
+        if (!passes_filter(event.pid) || !passes_name_filter(event.tid)) return;
 
         // Skip if already acquiring (duplicate probe)
         if (gil_start_.count(event.tid)) break;
@@ -426,7 +498,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
     case PerfEventType::TakeGilReturn: {
         if (!opts_.include_gil) return;
-        if (!passes_filter(event.pid)) return;
+        if (!passes_filter(event.pid) || !passes_name_filter(event.tid)) return;
 
         int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         auto it = gil_start_.find(event.tid);
@@ -449,7 +521,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
 
     case PerfEventType::DropGil: {
         if (!opts_.include_gil) return;
-        if (!passes_filter(event.pid)) return;
+        if (!passes_filter(event.pid) || !passes_name_filter(event.tid)) return;
 
         int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         auto it = gil_held_.find(event.tid);
@@ -482,7 +554,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     case PerfEventType::NcclReduceScatter: {
         if (!opts_.include_gpu) return;
         int32_t tgid = tgid_for(event.tid);
-        if (!passes_filter(tgid)) return;
+        if (!passes_filter(tgid) || !passes_name_filter(event.tid)) return;
         const char *name, *cat;
         switch (event.type) {
         case PerfEventType::NvidiaLaunch:       name = "cuLaunchKernel";       cat = "gpu"; break;
@@ -526,7 +598,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     case PerfEventType::NcclReduceScatterReturn: {
         if (!opts_.include_gpu) return;
         int32_t tgid = tgid_for(event.tid);
-        if (!passes_filter(tgid)) return;
+        if (!passes_filter(tgid) || !passes_name_filter(event.tid)) return;
         const char *name, *cat;
         switch (event.type) {
         case PerfEventType::NvidiaLaunchReturn:       name = "cuLaunchKernel";       cat = "gpu"; break;
@@ -569,7 +641,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_sched) return;
         int32_t tid = event.tid;
         int32_t tgid = tgid_for(tid);
-        if (!passes_filter(tgid)) return;
+        if (!passes_filter(tgid) || !passes_name_filter(tid)) return;
 
         auto it = sched_state_.find(tid);
         if (it == sched_state_.end()) {
@@ -624,7 +696,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_sched) return;
         int32_t tid = event.tid;
         int32_t tgid = tgid_for(tid);
-        if (!passes_filter(tgid)) return;
+        if (!passes_filter(tgid) || !passes_name_filter(tid)) return;
 
         auto it = sched_state_.find(tid);
         if (it == sched_state_.end()) {
@@ -670,7 +742,7 @@ void MergeEngine::flush_sched_state() {
 
     for (const auto &[tid, state] : sched_state_) {
         int32_t tgid = tgid_for(tid);
-        if (!passes_filter(tgid)) continue;
+        if (!passes_filter(tgid) || !passes_name_filter(tid)) continue;
 
         int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
         double start_us = aligner_.align_perf(state.last_event_ns);
@@ -714,6 +786,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
     // Build tid map from fork events collected during read + viz events
     std::vector<PerfEvent> empty_forks; // fork events already loaded in set_perf_source
     build_tid_map(empty_forks, viz_events);
+    build_viz_name_map(viz_events);
     write_metadata();
     total_viz_events_ = viz_events.size();
 
@@ -743,6 +816,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
             double ts = aligner_.align_viz(ve.ts_us);
 
             if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+                passes_name_filter(static_cast<int32_t>(ve.tid)) &&
                 (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
                 std::string_view args = ve.args_json.empty() ? "{}" :
                     std::string_view(ve.args_json);
@@ -799,6 +873,7 @@ void MergeEngine::write_perf_only() {
     std::vector<PerfEvent> empty_forks;
     std::vector<VizEvent> empty_viz;
     build_tid_map(empty_forks, empty_viz);
+    build_viz_name_map(empty_viz);
     write_metadata();
     if (perf_iter_) {
         while (perf_iter_->has_next()) {
@@ -814,10 +889,12 @@ void MergeEngine::write_perf_only() {
 }
 
 void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
+    build_viz_name_map(viz_events);
     total_viz_events_ = viz_events.size();
     for (const auto &ve : viz_events) {
         double ts = aligner_.align_viz(ve.ts_us);
         if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+            passes_name_filter(static_cast<int32_t>(ve.tid)) &&
             (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
             std::string_view args = ve.args_json.empty() ? "{}" :
                 std::string_view(ve.args_json);
