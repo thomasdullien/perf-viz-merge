@@ -74,7 +74,7 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
             defined_tracks_.insert(parent_uuid);
             emit_thread_track(pid, real_tid, "");
         }
-        emit_child_track(uuid, parent_uuid, "GPU", 3);
+        emit_child_track(uuid, parent_uuid, "GPU", -1);
     } else if (tid >= SCHED_TID_OFFSET && tid < SCHED_RANGE_END) {
         int64_t real_tid = tid - SCHED_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
@@ -82,7 +82,7 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
             defined_tracks_.insert(parent_uuid);
             emit_thread_track(pid, real_tid, "");
         }
-        emit_child_track(uuid, parent_uuid, "sched", 0);
+        emit_child_track(uuid, parent_uuid, "sched", -3);
     } else if (tid >= GIL_TID_OFFSET && tid < GIL_RANGE_END) {
         int64_t real_tid = tid - GIL_TID_OFFSET;
         uint64_t parent_uuid = 100000000ULL + static_cast<uint64_t>(real_tid);
@@ -90,7 +90,7 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
             defined_tracks_.insert(parent_uuid);
             emit_thread_track(pid, real_tid, "");
         }
-        emit_child_track(uuid, parent_uuid, "GIL", 1);
+        emit_child_track(uuid, parent_uuid, "GIL", -2);
     } else {
         // Regular thread track
         emit_thread_track(pid, tid, "");

@@ -214,7 +214,7 @@ echo "--- Test 6: Perfetto trace_processor validation ---"
 if command -v trace_processor_shell &>/dev/null; then
     if [ -f "$MERGED_OUTPUT" ]; then
         SLICE_COUNT=$(trace_processor_shell "$MERGED_OUTPUT" \
-            --query "SELECT count(*) as cnt FROM slice" 2>/dev/null | tail -1 || echo "error")
+            -Q "SELECT count(*) as cnt FROM slice" 2>/dev/null | tail -1 || echo "error")
         if [ "$SLICE_COUNT" != "error" ] && [ "$SLICE_COUNT" -gt 0 ] 2>/dev/null; then
             pass "Perfetto trace_processor loaded file ($SLICE_COUNT slices)"
         else

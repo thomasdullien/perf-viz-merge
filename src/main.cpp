@@ -19,6 +19,7 @@
 #include "output_writer.h"
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
+#include "chunking_writer.h"
 #include "streaming_sort.h"
 #include "viz_json_reader.h"
 
@@ -179,9 +180,9 @@ int main(int argc, char *argv[]) {
     static constexpr size_t STREAMING_THRESHOLD = 8ULL * 1024 * 1024 * 1024;  // 8GB
     static constexpr size_t REORDER_BUFFER_SIZE = 1'000'000;  // ~88MB
 
-    // When chunking is enabled, we always need perf events in memory so we
-    // can replay them for each chunk.
-    bool need_perf_in_memory = (chunk_duration_s > 0);
+    // Chunking re-opens perf file per chunk via streaming iterator,
+    // so we never need to load all perf events into memory.
+    bool need_perf_in_memory = false;
 
     if (!perf_path.empty()) {
         if (opts.verbose) {
@@ -204,29 +205,12 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (file_size < STREAMING_THRESHOLD || need_perf_in_memory) {
-                // In-memory path: load all events, sort in-memory
-                // Also used when chunking is enabled (need to replay per chunk)
+            if (file_size < STREAMING_THRESHOLD) {
+                // Small-file fast path: load all events, sort in-memory
                 if (opts.verbose) {
-                    if (need_perf_in_memory && file_size >= STREAMING_THRESHOLD) {
-                        fmt::print(stderr, "Using in-memory sort (chunking requires replay)\n");
-                    } else {
-                        fmt::print(stderr, "Using in-memory sort (file < 8GB)\n");
-                    }
+                    fmt::print(stderr, "Using in-memory sort (file < 8GB)\n");
                 }
-
-                if (file_size >= STREAMING_THRESHOLD) {
-                    // For large files with chunking: use reorder buffer to drain
-                    // into sorted vector
-                    auto reorder = std::make_unique<ReorderBufferIterator>(
-                        std::move(reader), REORDER_BUFFER_SIZE);
-                    fork_events = reorder->fork_events();
-                    // Drain the reorder buffer into a vector
-                    while (reorder->has_next()) {
-                        perf_events_vec.push_back(reorder->peek());
-                        reorder->advance();
-                    }
-                } else {
+                {
                     reader->read_all_events([&](const PerfEvent &event) {
                         perf_events_vec.push_back(event);
                         if (event.type == PerfEventType::SchedFork)
@@ -404,16 +388,21 @@ int main(int argc, char *argv[]) {
               });
 
     // Helper lambda to run a single merge pass with given options and output path
-    auto run_merge = [&](const std::string &out_path, MergeEngine::Options &chunk_opts) {
+    auto run_merge = [&](const std::string &out_path, MergeEngine::Options &chunk_opts,
+                         bool reopen_perf = false) {
         auto writer = std::make_unique<PerfettoWriter>(out_path);
 
         MergeEngine engine(*writer, aligner, chunk_opts);
 
         if (has_perf) {
-            // Create a fresh iterator from the in-memory vector (for chunked replay)
-            // or use the existing iterator (for single-pass)
-            if (!perf_events_vec.empty()) {
-                // Copy the vector so VectorPerfIterator can own it
+            if (reopen_perf && !perf_path.empty()) {
+                // Re-open perf file with a fresh streaming iterator per chunk
+                auto reader = std::make_unique<PerfDataReader>(perf_path);
+                auto reorder = std::make_unique<ReorderBufferIterator>(
+                    std::move(reader), REORDER_BUFFER_SIZE);
+                engine.set_perf_source(std::move(reorder), comm_map,
+                                       fork_events, perf_max_ts);
+            } else if (!perf_events_vec.empty()) {
                 auto events_copy = perf_events_vec;
                 auto iter = std::make_unique<VectorPerfIterator>(std::move(events_copy));
                 engine.set_perf_source(std::move(iter), comm_map,
@@ -451,7 +440,11 @@ int main(int argc, char *argv[]) {
 
     try {
         if (chunk_duration_s > 0) {
-            // --- Chunked output ---
+            // --- Chunked output (single-pass) ---
+            //
+            // Uses ChunkingWriter to swap the underlying PerfettoWriter
+            // at chunk boundaries during a single pass through the data.
+            // This avoids re-reading the perf.data file for each chunk.
 
             // Determine the global time range across all sources (in aligned us)
             double global_min_us = std::numeric_limits<double>::max();
@@ -475,6 +468,7 @@ int main(int argc, char *argv[]) {
             }
 
             double total_duration_s = (global_max_us - global_min_us) / 1e6;
+            double chunk_duration_us = chunk_duration_s * 1e6;
             int num_chunks = static_cast<int>(
                 std::ceil(total_duration_s / chunk_duration_s));
             if (num_chunks < 1) num_chunks = 1;
@@ -483,60 +477,64 @@ int main(int argc, char *argv[]) {
 
             if (opts.verbose) {
                 fmt::print(stderr, "Chunked output: {:.1f}s total, {:.1f}s per chunk, "
-                           "{} chunks\n", total_duration_s, chunk_duration_s, num_chunks);
+                           "{} chunks (single-pass)\n",
+                           total_duration_s, chunk_duration_s, num_chunks);
             }
 
-            uint64_t total_events = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                double chunk_start_s = c * chunk_duration_s;
-                double chunk_end_s = (c + 1) * chunk_duration_s;
+            // Create the chunking writer
+            auto chunker = std::make_unique<ChunkingWriter>(
+                chunk_duration_us, global_min_us,
+                stem, ext, num_chunks, opts.verbose);
 
-                // Build chunk options based on the original opts
-                MergeEngine::Options chunk_opts = opts;
-                chunk_opts.time_start_s = chunk_start_s;
-
-                if (c < num_chunks - 1) {
-                    // Non-final chunk: exclusive end boundary so events on
-                    // the boundary go to the next chunk
-                    chunk_opts.time_end_s = chunk_end_s;
-                    chunk_opts.time_end_exclusive = true;
-                } else {
-                    // Final chunk: inclusive end (capture everything remaining)
-                    chunk_opts.time_end_s = -1;
-                }
-
-                // Apply any user-specified time bounds as additional constraints
-                if (opts.time_start_s >= 0 && opts.time_start_s > chunk_start_s) {
-                    chunk_opts.time_start_s = opts.time_start_s;
-                }
-                if (opts.time_end_s >= 0) {
-                    if (c < num_chunks - 1 && opts.time_end_s < chunk_end_s) {
-                        chunk_opts.time_end_s = opts.time_end_s;
-                        chunk_opts.time_end_exclusive = false;  // user-specified, inclusive
-                    } else if (c == num_chunks - 1) {
-                        chunk_opts.time_end_s = opts.time_end_s;
-                        chunk_opts.time_end_exclusive = false;
+            // Set up context span injection for boundary-crossing viz events
+            chunker->set_context_callback(
+                [&](int chunk_idx, double chunk_start_us, double chunk_end_us,
+                    OutputWriter &writer) {
+                    if (chunk_idx == 0) return;  // first chunk has no context
+                    int count = 0;
+                    for (const auto &ve : viz_events) {
+                        if (ve.ph != 'X') continue;
+                        double aligned_ts = aligner.align_viz(ve.ts_us);
+                        double event_end = aligned_ts + ve.dur_us;
+                        if (aligned_ts < chunk_start_us && event_end > chunk_start_us) {
+                            double clamped_dur = event_end - chunk_start_us;
+                            if (event_end > chunk_end_us)
+                                clamped_dur = chunk_end_us - chunk_start_us;
+                            // Convert chunk_start back to viz time
+                            double clamped_ts = ve.ts_us + (chunk_start_us - aligned_ts);
+                            writer.write_complete(ve.name, ve.cat.empty() ? "python" : ve.cat,
+                                                  chunk_start_us, clamped_dur,
+                                                  ve.pid, ve.tid);
+                            count++;
+                        }
                     }
-                }
+                    if (opts.verbose && count > 0) {
+                        fmt::print(stderr, "  {} context spans carried from previous chunk\n",
+                                   count);
+                    }
+                });
 
-                std::string chunk_path = fmt::format("{}-{:03d}{}", stem, c, ext);
+            // Run a single merge pass — the chunking writer handles file splitting
+            MergeEngine engine(*chunker, aligner, opts);
 
-                if (opts.verbose) {
-                    fmt::print(stderr, "Writing chunk {} ({:.1f}s - {:.1f}s) to {}\n",
-                               c, chunk_start_s, chunk_end_s, chunk_path);
-                }
-
-                uint64_t events = run_merge(chunk_path, chunk_opts);
-                total_events += events;
-
-                if (opts.verbose) {
-                    fmt::print(stderr, "Chunk {}: {} events written\n", c, events);
-                }
+            if (perf_iter) {
+                engine.set_perf_source(std::move(perf_iter), comm_map,
+                                       fork_events, perf_max_ts);
             }
+
+            if (has_perf && !viz_paths.empty()) {
+                engine.merge_viz_events(viz_events);
+            } else if (has_perf) {
+                engine.write_perf_only();
+            } else {
+                engine.write_viz_only(viz_events);
+            }
+
+            chunker->finalize();
 
             if (opts.verbose) {
-                fmt::print(stderr, "Done. Total events across all chunks: {}\n",
-                           total_events);
+                fmt::print(stderr, "Done. {} chunks, {} total events\n",
+                           chunker->chunks_written(), chunker->events_written());
             }
         } else {
             // --- Single output (original behavior) ---

@@ -327,9 +327,9 @@ void MergeEngine::write_metadata() {
         int32_t tgid = tgid_for(tid);
         int sort_base = static_cast<int>(i) * 4;
 
-        // Sort index for the real thread (call stacks)
+        // Sort index for the real thread (call stacks) — below sched/GIL/GPU
         writer_.write_metadata("thread_sort_index", tgid, tid,
-                               fmt::format(R"({{"sort_index":{}}})", sort_base + 2));
+                               fmt::format(R"({{"sort_index":{}}})", sort_base + 3));
 
         if (opts_.include_sched) {
             int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
@@ -353,7 +353,7 @@ void MergeEngine::write_metadata() {
             std::string args = fmt::format(R"({{"name":"{}"}})", gpu_name);
             writer_.write_metadata("thread_name", tgid, gpu_tid, args);
             writer_.write_metadata("thread_sort_index", tgid, gpu_tid,
-                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 3));
+                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 2));
         }
     }
 }
