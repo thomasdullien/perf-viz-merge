@@ -27,9 +27,10 @@ void FtrcReader::read_all_events(EventCallback cb) {
             ve.ph = 'M';
             ve.ts_us = ev.ts_us;
             ve.dur_us = 0;
-            ve.name = "thread_name";
-            ve.args_json = fmt::format(R"({{"name":"{}"}})",
-                std::string_view(ev.name, ev.name_len));
+            /* name is "process_name" or "thread_name"; meta_value has the actual name */
+            ve.name = std::string(ev.name, ev.name_len);
+            std::string_view value(ev.meta_value, ev.meta_value_len);
+            ve.args_json = fmt::format(R"({{"name":"{}"}})", value);
         } else {
             ve.ph = 'X';
             ve.ts_us = ev.ts_us;

@@ -297,6 +297,9 @@ void PerfettoWriter::write_viz_event(char ph, std::string_view name,
     case 'I':
         write_instant(name, cat, ts_us, pid, tid, "t", args_json);
         break;
+    case 'M':
+        write_metadata(name, pid, tid, args_json);
+        break;
     default:
         // For unsupported phase types, emit as instant
         write_instant(name, cat, ts_us, pid, tid, "t", args_json);

@@ -110,7 +110,7 @@ build-static/simdjson.o: $(VENDOR_DIR)/simdjson/simdjson.cpp $(VENDOR_DIR)/simdj
 	@mkdir -p build-static
 	$(CXX) $(STATIC_CXXFLAGS) -MMD -MP -c -o $@ $<
 
-$(STATIC_TARGET): $(STATIC_OBJS)
+$(STATIC_TARGET): $(STATIC_OBJS) $(LIBFTRC_OBJ)
 	$(CXX) $(STATIC_CXXFLAGS) -o $@ $^ $(STATIC_LIBS) $(STATIC_LDFLAGS)
 	@echo "Static binary built: $(STATIC_TARGET) ($$(du -h $(STATIC_TARGET) | cut -f1))"
 	@echo "Verify: ldd $(STATIC_TARGET) should say 'not a dynamic executable'"
