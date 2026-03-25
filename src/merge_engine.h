@@ -29,6 +29,7 @@ struct MergeOptions {
     std::vector<std::string> filter_names;  // empty = no filter; substring match, OR'd
     double time_start_s = -1;  // relative seconds from trace start (-1 = no limit)
     double time_end_s = -1;    // relative seconds from trace start (-1 = no limit)
+    bool time_end_exclusive = false;  // if true, events at exactly time_end are excluded
 };
 
 class MergeEngine {

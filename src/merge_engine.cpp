@@ -58,7 +58,10 @@ bool MergeEngine::passes_name_filter(int32_t tid) const {
 
 bool MergeEngine::passes_time_filter(double ts_us) const {
     if (time_start_us_ >= 0 && ts_us < time_start_us_) return false;
-    if (time_end_us_ >= 0 && ts_us > time_end_us_) return false;
+    if (time_end_us_ >= 0) {
+        if (opts_.time_end_exclusive ? (ts_us >= time_end_us_) : (ts_us > time_end_us_))
+            return false;
+    }
     return true;
 }
 

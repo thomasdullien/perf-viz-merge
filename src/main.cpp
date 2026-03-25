@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -75,6 +77,8 @@ static void usage(const char *prog) {
         "                         from the beginning of the trace\n"
         "  --time-end <sec>       Only include events up to this many seconds\n"
         "                         from the beginning of the trace\n"
+        "  --chunk-duration <sec> Split output into multiple files, each covering\n"
+        "                         this many seconds of trace time\n"
         "  --no-sched             Omit scheduler events\n"
         "  --no-gil               Omit GIL tracking events\n"
         "  --no-gpu               Omit GPU/NCCL events\n"
@@ -90,6 +94,7 @@ int main(int argc, char *argv[]) {
     std::string output_path;
     double time_offset = 0;
     bool has_time_offset = false;
+    double chunk_duration_s = -1;  // -1 = no chunking
     MergeEngine::Options opts;
 
     // Parse arguments
@@ -119,6 +124,12 @@ int main(int argc, char *argv[]) {
             opts.time_start_s = std::atof(next());
         } else if (arg == "--time-end") {
             opts.time_end_s = std::atof(next());
+        } else if (arg == "--chunk-duration") {
+            chunk_duration_s = std::atof(next());
+            if (chunk_duration_s <= 0) {
+                fmt::print(stderr, "Error: --chunk-duration must be positive\n");
+                return 1;
+            }
         } else if (arg == "--no-sched") {
             opts.include_sched = false;
         } else if (arg == "--no-gil") {
@@ -157,6 +168,7 @@ int main(int argc, char *argv[]) {
 
     // Read perf events
     std::unique_ptr<PerfEventIterator> perf_iter;
+    std::vector<PerfEvent> perf_events_vec;  // kept for chunked replay
     std::vector<PerfEvent> fork_events;
     std::unordered_map<int32_t, std::string> comm_map;
     uint64_t perf_min_ts = 0, perf_max_ts = 0;
@@ -165,6 +177,10 @@ int main(int argc, char *argv[]) {
 
     static constexpr size_t STREAMING_THRESHOLD = 8ULL * 1024 * 1024 * 1024;  // 8GB
     static constexpr size_t REORDER_BUFFER_SIZE = 1'000'000;  // ~88MB
+
+    // When chunking is enabled, we always need perf events in memory so we
+    // can replay them for each chunk.
+    bool need_perf_in_memory = (chunk_duration_s > 0);
 
     if (!perf_path.empty()) {
         if (opts.verbose) {
@@ -187,37 +203,67 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (file_size < STREAMING_THRESHOLD) {
-                // Small-file fast path: load all events, sort in-memory
+            if (file_size < STREAMING_THRESHOLD || need_perf_in_memory) {
+                // In-memory path: load all events, sort in-memory
+                // Also used when chunking is enabled (need to replay per chunk)
                 if (opts.verbose) {
-                    fmt::print(stderr, "Using in-memory sort (file < 8GB)\n");
-                }
-                std::vector<PerfEvent> perf_events;
-                reader->read_all_events([&](const PerfEvent &event) {
-                    perf_events.push_back(event);
-                    if (event.type == PerfEventType::SchedFork)
-                        fork_events.push_back(event);
-                });
-                comm_map = reader->comm_map();
-                perf_event_count = perf_events.size();
-
-                // Sort with SchedSwitch-last tiebreaker
-                std::sort(perf_events.begin(), perf_events.end(),
-                          [](const PerfEvent &a, const PerfEvent &b) {
-                              if (a.timestamp_ns != b.timestamp_ns)
-                                  return a.timestamp_ns < b.timestamp_ns;
-                              auto pri = [](PerfEventType t) -> int {
-                                  return t == PerfEventType::SchedSwitch ? 1 : 0;
-                              };
-                              return pri(a.type) < pri(b.type);
-                          });
-
-                if (!perf_events.empty()) {
-                    perf_min_ts = perf_events.front().timestamp_ns;
-                    perf_max_ts = perf_events.back().timestamp_ns;
+                    if (need_perf_in_memory && file_size >= STREAMING_THRESHOLD) {
+                        fmt::print(stderr, "Using in-memory sort (chunking requires replay)\n");
+                    } else {
+                        fmt::print(stderr, "Using in-memory sort (file < 8GB)\n");
+                    }
                 }
 
-                perf_iter = std::make_unique<VectorPerfIterator>(std::move(perf_events));
+                if (file_size >= STREAMING_THRESHOLD) {
+                    // For large files with chunking: use reorder buffer to drain
+                    // into sorted vector
+                    auto reorder = std::make_unique<ReorderBufferIterator>(
+                        std::move(reader), REORDER_BUFFER_SIZE);
+                    fork_events = reorder->fork_events();
+                    // Drain the reorder buffer into a vector
+                    while (reorder->has_next()) {
+                        perf_events_vec.push_back(reorder->peek());
+                        reorder->advance();
+                    }
+                } else {
+                    reader->read_all_events([&](const PerfEvent &event) {
+                        perf_events_vec.push_back(event);
+                        if (event.type == PerfEventType::SchedFork)
+                            fork_events.push_back(event);
+                    });
+                    comm_map = reader->comm_map();
+
+                    // Sort with SchedSwitch-last tiebreaker
+                    std::sort(perf_events_vec.begin(), perf_events_vec.end(),
+                              [](const PerfEvent &a, const PerfEvent &b) {
+                                  if (a.timestamp_ns != b.timestamp_ns)
+                                      return a.timestamp_ns < b.timestamp_ns;
+                                  auto pri = [](PerfEventType t) -> int {
+                                      return t == PerfEventType::SchedSwitch ? 1 : 0;
+                                  };
+                                  return pri(a.type) < pri(b.type);
+                              });
+                }
+
+                perf_event_count = perf_events_vec.size();
+                if (!perf_events_vec.empty()) {
+                    perf_min_ts = perf_events_vec.front().timestamp_ns;
+                    perf_max_ts = perf_events_vec.back().timestamp_ns;
+                }
+
+                // Build fork_events from loaded data if not already populated
+                if (fork_events.empty()) {
+                    for (const auto &e : perf_events_vec) {
+                        if (e.type == PerfEventType::SchedFork)
+                            fork_events.push_back(e);
+                    }
+                }
+
+                if (!need_perf_in_memory) {
+                    // Non-chunked: move into iterator (single pass)
+                    perf_iter = std::make_unique<VectorPerfIterator>(
+                        std::move(perf_events_vec));
+                }
             } else {
                 // Large-file path: streaming reorder buffer
                 if (opts.verbose) {
@@ -340,19 +386,25 @@ int main(int argc, char *argv[]) {
                   return a.ts_us < b.ts_us;
               });
 
-    // Create output
-    if (opts.verbose) {
-        fmt::print(stderr, "Writing Perfetto output to {}\n", output_path);
-    }
+    // Helper lambda to run a single merge pass with given options and output path
+    auto run_merge = [&](const std::string &out_path, MergeEngine::Options &chunk_opts) {
+        auto writer = std::make_unique<PerfettoWriter>(out_path);
 
-    try {
-        auto writer = std::make_unique<PerfettoWriter>(output_path);
+        MergeEngine engine(*writer, aligner, chunk_opts);
 
-        MergeEngine engine(*writer, aligner, opts);
-
-        if (perf_iter) {
-            engine.set_perf_source(std::move(perf_iter), comm_map,
-                                   fork_events, perf_max_ts);
+        if (has_perf) {
+            // Create a fresh iterator from the in-memory vector (for chunked replay)
+            // or use the existing iterator (for single-pass)
+            if (!perf_events_vec.empty()) {
+                // Copy the vector so VectorPerfIterator can own it
+                auto events_copy = perf_events_vec;
+                auto iter = std::make_unique<VectorPerfIterator>(std::move(events_copy));
+                engine.set_perf_source(std::move(iter), comm_map,
+                                       fork_events, perf_max_ts);
+            } else if (perf_iter) {
+                engine.set_perf_source(std::move(perf_iter), comm_map,
+                                       fork_events, perf_max_ts);
+            }
         }
 
         if (has_perf && !viz_paths.empty()) {
@@ -364,10 +416,122 @@ int main(int argc, char *argv[]) {
         }
 
         writer->finalize();
+        return writer->events_written();
+    };
 
-        if (opts.verbose) {
-            fmt::print(stderr, "Done. Total events written: {}\n",
-                       writer->events_written());
+    // Determine output file stem and extension for chunked filenames
+    auto split_path = [](const std::string &path)
+        -> std::pair<std::string, std::string> {
+        // Find the last dot that is after any directory separator
+        auto last_sep = path.find_last_of('/');
+        auto last_dot = path.find_last_of('.');
+        if (last_dot != std::string::npos &&
+            (last_sep == std::string::npos || last_dot > last_sep)) {
+            return {path.substr(0, last_dot), path.substr(last_dot)};
+        }
+        return {path, ""};
+    };
+
+    try {
+        if (chunk_duration_s > 0) {
+            // --- Chunked output ---
+
+            // Determine the global time range across all sources (in aligned us)
+            double global_min_us = std::numeric_limits<double>::max();
+            double global_max_us = std::numeric_limits<double>::lowest();
+
+            if (has_perf && perf_min_ts > 0) {
+                double pmin = aligner.align_perf(perf_min_ts);
+                double pmax = aligner.align_perf(perf_max_ts);
+                if (pmin < global_min_us) global_min_us = pmin;
+                if (pmax > global_max_us) global_max_us = pmax;
+            }
+            for (const auto &ve : viz_events) {
+                double ts = aligner.align_viz(ve.ts_us);
+                if (ts < global_min_us) global_min_us = ts;
+                if (ts > global_max_us) global_max_us = ts;
+            }
+
+            if (global_min_us > global_max_us) {
+                fmt::print(stderr, "Error: no events found for chunking\n");
+                return 1;
+            }
+
+            double total_duration_s = (global_max_us - global_min_us) / 1e6;
+            int num_chunks = static_cast<int>(
+                std::ceil(total_duration_s / chunk_duration_s));
+            if (num_chunks < 1) num_chunks = 1;
+
+            auto [stem, ext] = split_path(output_path);
+
+            if (opts.verbose) {
+                fmt::print(stderr, "Chunked output: {:.1f}s total, {:.1f}s per chunk, "
+                           "{} chunks\n", total_duration_s, chunk_duration_s, num_chunks);
+            }
+
+            uint64_t total_events = 0;
+            for (int c = 0; c < num_chunks; c++) {
+                double chunk_start_s = c * chunk_duration_s;
+                double chunk_end_s = (c + 1) * chunk_duration_s;
+
+                // Build chunk options based on the original opts
+                MergeEngine::Options chunk_opts = opts;
+                chunk_opts.time_start_s = chunk_start_s;
+
+                if (c < num_chunks - 1) {
+                    // Non-final chunk: exclusive end boundary so events on
+                    // the boundary go to the next chunk
+                    chunk_opts.time_end_s = chunk_end_s;
+                    chunk_opts.time_end_exclusive = true;
+                } else {
+                    // Final chunk: inclusive end (capture everything remaining)
+                    chunk_opts.time_end_s = -1;
+                }
+
+                // Apply any user-specified time bounds as additional constraints
+                if (opts.time_start_s >= 0 && opts.time_start_s > chunk_start_s) {
+                    chunk_opts.time_start_s = opts.time_start_s;
+                }
+                if (opts.time_end_s >= 0) {
+                    if (c < num_chunks - 1 && opts.time_end_s < chunk_end_s) {
+                        chunk_opts.time_end_s = opts.time_end_s;
+                        chunk_opts.time_end_exclusive = false;  // user-specified, inclusive
+                    } else if (c == num_chunks - 1) {
+                        chunk_opts.time_end_s = opts.time_end_s;
+                        chunk_opts.time_end_exclusive = false;
+                    }
+                }
+
+                std::string chunk_path = fmt::format("{}-{:03d}{}", stem, c, ext);
+
+                if (opts.verbose) {
+                    fmt::print(stderr, "Writing chunk {} ({:.1f}s - {:.1f}s) to {}\n",
+                               c, chunk_start_s, chunk_end_s, chunk_path);
+                }
+
+                uint64_t events = run_merge(chunk_path, chunk_opts);
+                total_events += events;
+
+                if (opts.verbose) {
+                    fmt::print(stderr, "Chunk {}: {} events written\n", c, events);
+                }
+            }
+
+            if (opts.verbose) {
+                fmt::print(stderr, "Done. Total events across all chunks: {}\n",
+                           total_events);
+            }
+        } else {
+            // --- Single output (original behavior) ---
+            if (opts.verbose) {
+                fmt::print(stderr, "Writing Perfetto output to {}\n", output_path);
+            }
+
+            uint64_t events = run_merge(output_path, opts);
+
+            if (opts.verbose) {
+                fmt::print(stderr, "Done. Total events written: {}\n", events);
+            }
         }
     } catch (const std::exception &e) {
         fmt::print(stderr, "Error writing output: {}\n", e.what());
