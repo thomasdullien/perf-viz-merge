@@ -695,11 +695,27 @@ void MergeEngine::flush_sched_state() {
     }
 }
 
+void MergeEngine::maybe_report_progress() {
+    static constexpr uint64_t INTERVAL = 1'000'000;
+    progress_counter_++;
+    if (progress_counter_ % INTERVAL != 0) return;
+    uint64_t total = perf_written_ + viz_written_;
+    if (total_viz_events_ > 0) {
+        double pct = 100.0 * viz_written_ / total_viz_events_;
+        fmt::print(stderr, "\r  Progress: {} perf + {} viz events written ({:.1f}% of viz)   ",
+                   perf_written_, viz_written_, pct);
+    } else {
+        fmt::print(stderr, "\r  Progress: {} perf + {} viz events written   ",
+                   perf_written_, viz_written_);
+    }
+}
+
 void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
     // Build tid map from fork events collected during read + viz events
     std::vector<PerfEvent> empty_forks; // fork events already loaded in set_perf_source
     build_tid_map(empty_forks, viz_events);
     write_metadata();
+    total_viz_events_ = viz_events.size();
 
     // Two-pointer merge of time-sorted perf events and viz events
     size_t vi = 0; // viz index
@@ -721,6 +737,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
         if (emit_perf) {
             emit_perf_event(perf_iter_->peek());
             perf_iter_->advance();
+            if (opts_.verbose) maybe_report_progress();
         } else {
             const VizEvent &ve = viz_events[vi];
             double ts = aligner_.align_viz(ve.ts_us);
@@ -744,6 +761,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
                 viz_written_++;
             }
             vi++;
+            if (opts_.verbose) maybe_report_progress();
         }
     }
 
@@ -751,6 +769,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
     flush_sched_state();
 
     if (opts_.verbose) {
+        fmt::print(stderr, "\n");
         fmt::print(stderr, "Wrote {} perf events and {} viz events\n",
                    perf_written_, viz_written_);
         if (sched_mismatch_count_ > 0) {
@@ -785,15 +804,17 @@ void MergeEngine::write_perf_only() {
         while (perf_iter_->has_next()) {
             emit_perf_event(perf_iter_->peek());
             perf_iter_->advance();
+            if (opts_.verbose) maybe_report_progress();
         }
     }
     flush_sched_state();
     if (opts_.verbose) {
-        fmt::print(stderr, "Wrote {} perf events\n", perf_written_);
+        fmt::print(stderr, "\nWrote {} perf events\n", perf_written_);
     }
 }
 
 void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
+    total_viz_events_ = viz_events.size();
     for (const auto &ve : viz_events) {
         double ts = aligner_.align_viz(ve.ts_us);
         if (passes_filter(static_cast<int32_t>(ve.pid)) &&
@@ -814,8 +835,9 @@ void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
                                     ts, ve.dur_us, ve.pid, ve.tid, args);
             viz_written_++;
         }
+        if (opts_.verbose) maybe_report_progress();
     }
     if (opts_.verbose) {
-        fmt::print(stderr, "Wrote {} viz events\n", viz_written_);
+        fmt::print(stderr, "\nWrote {} viz events\n", viz_written_);
     }
 }

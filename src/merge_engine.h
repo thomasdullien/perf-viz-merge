@@ -94,6 +94,10 @@ private:
 
     uint64_t perf_written_ = 0;
     uint64_t viz_written_ = 0;
+    uint64_t progress_counter_ = 0;
+    uint64_t total_viz_events_ = 0;  // set before merge for progress
+
+    void maybe_report_progress();
     uint64_t sched_mismatch_count_ = 0;
     uint64_t sched_switch_total_ = 0;
     uint64_t sched_switch_filtered_ = 0;
