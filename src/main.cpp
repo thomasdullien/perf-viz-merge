@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -298,6 +299,22 @@ int main(int argc, char *argv[]) {
 
     // Read VizTracer events
     std::vector<VizEvent> viz_events;
+
+    // Pre-estimate capacity from file sizes to avoid repeated reallocations.
+    // For ftrc files: ~12 bytes/raw event, ~2 raw events per completed event,
+    // plus header overhead. Rough estimate: file_size / 24.
+    {
+        size_t estimated = 0;
+        for (const auto &vp : viz_paths) {
+            struct stat st;
+            if (stat(vp.c_str(), &st) == 0) {
+                estimated += static_cast<size_t>(st.st_size) / 24;
+            }
+        }
+        if (estimated > 0) {
+            viz_events.reserve(estimated);
+        }
+    }
 
     for (const auto &viz_path : viz_paths) {
         if (opts.verbose) {
