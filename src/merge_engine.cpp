@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 #include <fmt/format.h>
 
@@ -55,6 +56,11 @@ bool MergeEngine::passes_name_filter(int32_t tid) const {
     return false;
 }
 
+bool MergeEngine::passes_time_filter(double ts_us) const {
+    if (time_start_us_ >= 0 && ts_us < time_start_us_) return false;
+    if (time_end_us_ >= 0 && ts_us > time_end_us_) return false;
+    return true;
+}
 
 void MergeEngine::build_viz_name_map(const std::vector<VizEvent> &viz_events) {
     for (const auto &ve : viz_events) {
@@ -83,6 +89,43 @@ void MergeEngine::build_viz_name_map(const std::vector<VizEvent> &viz_events) {
     }
 }
 
+void MergeEngine::compute_time_bounds(const std::vector<VizEvent> &viz_events) {
+    if (opts_.time_start_s < 0 && opts_.time_end_s < 0) return;
+
+    // Find the minimum timestamp across all sources
+    double min_ts_us = std::numeric_limits<double>::max();
+
+    // From perf (already aligned)
+    if (perf_iter_ && perf_iter_->has_next()) {
+        double perf_start_us = aligner_.align_perf(perf_iter_->peek().timestamp_ns);
+        if (perf_start_us < min_ts_us) min_ts_us = perf_start_us;
+    }
+
+    // From viz events
+    for (const auto &ve : viz_events) {
+        double ts = aligner_.align_viz(ve.ts_us);
+        if (ts < min_ts_us) {
+            min_ts_us = ts;
+        }
+    }
+
+    if (min_ts_us == std::numeric_limits<double>::max()) return;
+
+    if (opts_.time_start_s >= 0) {
+        time_start_us_ = min_ts_us + opts_.time_start_s * 1e6;
+    }
+    if (opts_.time_end_s >= 0) {
+        time_end_us_ = min_ts_us + opts_.time_end_s * 1e6;
+    }
+
+    if (opts_.verbose) {
+        fmt::print(stderr, "Time range filter: trace starts at {:.3f} us\n", min_ts_us);
+        if (time_start_us_ >= 0)
+            fmt::print(stderr, "  start: +{:.3f}s -> {:.3f} us\n", opts_.time_start_s, time_start_us_);
+        if (time_end_us_ >= 0)
+            fmt::print(stderr, "  end:   +{:.3f}s -> {:.3f} us\n", opts_.time_end_s, time_end_us_);
+    }
+}
 
 int32_t MergeEngine::tgid_for(int32_t tid) const {
     auto it = tid_to_tgid_.find(tid);
@@ -314,6 +357,9 @@ void MergeEngine::write_metadata() {
 
 void MergeEngine::emit_perf_event(const PerfEvent &event) {
     double ts_us = aligner_.align_perf(event.timestamp_ns);
+
+    // Time range filter: skip events outside the range
+    if (!passes_time_filter(ts_us)) return;
 
     switch (event.type) {
     case PerfEventType::SchedSwitch: {
@@ -787,6 +833,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
     std::vector<PerfEvent> empty_forks; // fork events already loaded in set_perf_source
     build_tid_map(empty_forks, viz_events);
     build_viz_name_map(viz_events);
+    compute_time_bounds(viz_events);
     write_metadata();
     total_viz_events_ = viz_events.size();
 
@@ -817,6 +864,7 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
 
             if (passes_filter(static_cast<int32_t>(ve.pid)) &&
                 passes_name_filter(static_cast<int32_t>(ve.tid)) &&
+                passes_time_filter(ts) &&
                 (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
                 std::string_view args = ve.args_json.empty() ? "{}" :
                     std::string_view(ve.args_json);
@@ -874,6 +922,7 @@ void MergeEngine::write_perf_only() {
     std::vector<VizEvent> empty_viz;
     build_tid_map(empty_forks, empty_viz);
     build_viz_name_map(empty_viz);
+    compute_time_bounds(empty_viz);
     write_metadata();
     if (perf_iter_) {
         while (perf_iter_->has_next()) {
@@ -890,11 +939,13 @@ void MergeEngine::write_perf_only() {
 
 void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
     build_viz_name_map(viz_events);
+    compute_time_bounds(viz_events);
     total_viz_events_ = viz_events.size();
     for (const auto &ve : viz_events) {
         double ts = aligner_.align_viz(ve.ts_us);
         if (passes_filter(static_cast<int32_t>(ve.pid)) &&
             passes_name_filter(static_cast<int32_t>(ve.tid)) &&
+            passes_time_filter(ts) &&
             (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
             std::string_view args = ve.args_json.empty() ? "{}" :
                 std::string_view(ve.args_json);

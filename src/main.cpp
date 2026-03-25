@@ -71,6 +71,10 @@ static void usage(const char *prog) {
         "  --filter-pid <pid>     Only include events for this PID\n"
         "  --filter-name <pat>    Only include events from threads/processes matching\n"
         "                         substring (may be repeated; matches are OR'd)\n"
+        "  --time-start <sec>     Only include events starting at this many seconds\n"
+        "                         from the beginning of the trace\n"
+        "  --time-end <sec>       Only include events up to this many seconds\n"
+        "                         from the beginning of the trace\n"
         "  --no-sched             Omit scheduler events\n"
         "  --no-gil               Omit GIL tracking events\n"
         "  --no-gpu               Omit GPU/NCCL events\n"
@@ -111,6 +115,10 @@ int main(int argc, char *argv[]) {
             opts.filter_pid = std::atoi(next());
         } else if (arg == "--filter-name") {
             opts.filter_names.push_back(next());
+        } else if (arg == "--time-start") {
+            opts.time_start_s = std::atof(next());
+        } else if (arg == "--time-end") {
+            opts.time_end_s = std::atof(next());
         } else if (arg == "--no-sched") {
             opts.include_sched = false;
         } else if (arg == "--no-gil") {
