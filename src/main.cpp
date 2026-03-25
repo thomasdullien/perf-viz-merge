@@ -70,6 +70,8 @@ static void usage(const char *prog) {
         "  -o, --output <path>    Output file (default: merged.perfetto-trace)\n"
         "  --time-offset <us>     Manual time offset in microseconds\n"
         "  --filter-pid <pid>     Only include events for this PID\n"
+        "  --filter-name <pat>    Only include events from threads/processes matching\n"
+        "                         substring (may be repeated; matches are OR'd)\n"
         "  --no-sched             Omit scheduler events\n"
         "  --no-gil               Omit GIL tracking events\n"
         "  --no-gpu               Omit GPU/NCCL events\n"
@@ -108,6 +110,8 @@ int main(int argc, char *argv[]) {
             has_time_offset = true;
         } else if (arg == "--filter-pid") {
             opts.filter_pid = std::atoi(next());
+        } else if (arg == "--filter-name") {
+            opts.filter_names.push_back(next());
         } else if (arg == "--no-sched") {
             opts.include_sched = false;
         } else if (arg == "--no-gil") {
