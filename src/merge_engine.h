@@ -25,6 +25,7 @@ struct MergeOptions {
     bool include_gpu = true;
     bool verbose = false;
     int32_t filter_pid = -1;  // -1 = no filter
+    double min_duration_us = 0;  // skip viz events shorter than this (0 = keep all)
 };
 
 class MergeEngine {

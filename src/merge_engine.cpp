@@ -725,7 +725,8 @@ void MergeEngine::merge_viz_events(const std::vector<VizEvent> &viz_events) {
             const VizEvent &ve = viz_events[vi];
             double ts = aligner_.align_viz(ve.ts_us);
 
-            if (passes_filter(static_cast<int32_t>(ve.pid))) {
+            if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+                (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
                 std::string_view args = ve.args_json.empty() ? "{}" :
                     std::string_view(ve.args_json);
                 std::string_view cat = ve.cat.empty() ? "python" :
@@ -795,7 +796,8 @@ void MergeEngine::write_perf_only() {
 void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
     for (const auto &ve : viz_events) {
         double ts = aligner_.align_viz(ve.ts_us);
-        if (passes_filter(static_cast<int32_t>(ve.pid))) {
+        if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+            (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
             std::string_view args = ve.args_json.empty() ? "{}" :
                 std::string_view(ve.args_json);
             std::string_view cat = ve.cat.empty() ? "python" :

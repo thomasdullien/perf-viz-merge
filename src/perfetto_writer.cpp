@@ -99,7 +99,8 @@ void PerfettoWriter::ensure_track(int64_t pid, int64_t tid) {
 
 void PerfettoWriter::emit_process_track(int64_t pid, std::string_view name) {
     uint64_t uuid = static_cast<uint64_t>(pid);
-    if (defined_tracks_.count(uuid)) return;
+    // Skip if already defined, unless we now have a name to update with
+    if (defined_tracks_.count(uuid) && name.empty()) return;
     defined_tracks_.insert(uuid);
 
     ProtoEncoder packet;

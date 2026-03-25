@@ -72,6 +72,7 @@ static void usage(const char *prog) {
         "  --no-sched             Omit scheduler events\n"
         "  --no-gil               Omit GIL tracking events\n"
         "  --no-gpu               Omit GPU/NCCL events\n"
+        "  --min-duration <us>    Skip viz events shorter than this (microseconds)\n"
         "  -v, --verbose          Print progress information\n"
         "  -h, --help             Show this help\n",
         prog);
@@ -112,6 +113,8 @@ int main(int argc, char *argv[]) {
             opts.include_gil = false;
         } else if (arg == "--no-gpu") {
             opts.include_gpu = false;
+        } else if (arg == "--min-duration") {
+            opts.min_duration_us = std::atof(next());
         } else if (arg == "-v" || arg == "--verbose") {
             opts.verbose = true;
         } else if (arg == "-h" || arg == "--help") {
