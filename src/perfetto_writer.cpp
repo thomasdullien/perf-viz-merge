@@ -232,11 +232,16 @@ void PerfettoWriter::write_track_event(std::string_view name,
     packet.write_uint64(TracePacketFields::timestamp, ts_ns);
 
     // TrackEvent submessage
+    // SLICE_END events omit name_iid/category_iids — trace_processor uses
+    // LIFO stack matching for ENDs. Including names would cause spurious
+    // "misplaced_end_event" warnings when same-timestamp events get reordered.
     packet.write_nested(TracePacketFields::track_event, [&](ProtoEncoder &te) {
         te.write_uint64(TrackEventFields::type, event_type);
         te.write_uint64(TrackEventFields::track_uuid, uuid);
-        te.write_uint64(TrackEventFields::name_iid, name_iid);
-        te.write_uint64(TrackEventFields::category_iids, cat_iid);
+        if (event_type != TrackEventType::SLICE_END) {
+            te.write_uint64(TrackEventFields::name_iid, name_iid);
+            te.write_uint64(TrackEventFields::category_iids, cat_iid);
+        }
     });
 
     // Interned data (if any new strings were interned)

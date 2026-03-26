@@ -381,10 +381,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Sort viz events by timestamp
+    // Sort viz events by timestamp, then by call stack depth so that
+    // parent spans (lower depth) are emitted before child spans (higher
+    // depth) when they share the same start timestamp. This ensures
+    // correct nesting in the Perfetto output (BEGIN of parent before
+    // BEGIN of child). Falls back to descending duration for events
+    // without depth info (depth=-1, e.g. from JSON sources).
     std::sort(viz_events.begin(), viz_events.end(),
               [](const VizEvent &a, const VizEvent &b) {
-                  return a.ts_us < b.ts_us;
+                  if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
+                  if (a.depth >= 0 && b.depth >= 0) return a.depth < b.depth;
+                  return a.dur_us > b.dur_us;
               });
 
     // Helper lambda to run a single merge pass with given options and output path

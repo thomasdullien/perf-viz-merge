@@ -15,6 +15,7 @@ void FtrcReader::read_all_events(EventCallback cb) {
     ftrc_event ev;
     while (ftrc_next(r, &ev) == 0) {
         VizEvent ve; ve.pid = ev.pid; ve.tid = static_cast<int64_t>(ev.tid);
+        ve.depth = ev.depth;
         if (ev.type == FTRC_EVENT_METADATA) {
             ve.ph = 'M'; ve.ts_us = ev.ts_us; ve.dur_us = 0;
             ve.name = std::string_view(ev.name, ev.name_len);
