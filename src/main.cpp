@@ -20,6 +20,7 @@
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
 #include "chunking_writer.h"
+#include "metric_csv_reader.h"
 #include "streaming_sort.h"
 #include "viz_json_reader.h"
 
@@ -81,6 +82,8 @@ static void usage(const char *prog) {
         "                         from the beginning of the trace\n"
         "  --chunk-duration <sec> Split output into multiple files, each covering\n"
         "                         this many seconds of trace time\n"
+        "  --cpu-metrics <csv>    CSV file with CPU/memory utilization metrics\n"
+        "  --gpu-metrics <csv>    CSV file with GPU utilization metrics\n"
         "  --no-sched             Omit scheduler events\n"
         "  --no-gil               Omit GIL tracking events\n"
         "  --no-gpu               Omit GPU/NCCL events\n"
@@ -97,6 +100,8 @@ int main(int argc, char *argv[]) {
     double time_offset = 0;
     bool has_time_offset = false;
     double chunk_duration_s = -1;  // -1 = no chunking
+    std::string cpu_metrics_path;
+    std::string gpu_metrics_path;
     MergeEngine::Options opts;
 
     // Parse arguments
@@ -132,6 +137,10 @@ int main(int argc, char *argv[]) {
                 fmt::print(stderr, "Error: --chunk-duration must be positive\n");
                 return 1;
             }
+        } else if (arg == "--cpu-metrics") {
+            cpu_metrics_path = next();
+        } else if (arg == "--gpu-metrics") {
+            gpu_metrics_path = next();
         } else if (arg == "--no-sched") {
             opts.include_sched = false;
         } else if (arg == "--no-gil") {
@@ -394,6 +403,53 @@ int main(int argc, char *argv[]) {
                   return a.dur_us > b.dur_us;
               });
 
+    // Load metric CSV files (if provided)
+    std::vector<MetricSample> metric_samples;
+    if (!cpu_metrics_path.empty()) {
+        MetricCsvReader reader(cpu_metrics_path);
+        auto samples = reader.read_all("CPU ");
+        if (opts.verbose) {
+            fmt::print(stderr, "Read {} CPU metric samples from {}\n",
+                       samples.size(), cpu_metrics_path);
+        }
+        metric_samples.insert(metric_samples.end(),
+                              std::make_move_iterator(samples.begin()),
+                              std::make_move_iterator(samples.end()));
+    }
+    if (!gpu_metrics_path.empty()) {
+        MetricCsvReader reader(gpu_metrics_path);
+        auto samples = reader.read_all("GPU ");
+        if (opts.verbose) {
+            fmt::print(stderr, "Read {} GPU metric samples from {}\n",
+                       samples.size(), gpu_metrics_path);
+        }
+        metric_samples.insert(metric_samples.end(),
+                              std::make_move_iterator(samples.begin()),
+                              std::make_move_iterator(samples.end()));
+    }
+    if (!metric_samples.empty()) {
+        std::sort(metric_samples.begin(), metric_samples.end(),
+                  [](const MetricSample &a, const MetricSample &b) {
+                      return a.ts_us < b.ts_us;
+                  });
+    }
+
+    // Helper to write metrics to a PerfettoWriter within a time range
+    auto write_metrics = [&](PerfettoWriter &writer, int64_t pid,
+                             double start_us = -1, double end_us = -1) {
+        size_t count = 0;
+        for (const auto &m : metric_samples) {
+            double ts = aligner.align_viz(m.ts_us);
+            if (start_us >= 0 && ts < start_us) continue;
+            if (end_us >= 0 && ts > end_us) continue;
+            writer.write_counter(m.name, ts, m.value, pid);
+            count++;
+        }
+        if (opts.verbose && count > 0) {
+            fmt::print(stderr, "Wrote {} metric counter events\n", count);
+        }
+    };
+
     // Helper lambda to run a single merge pass with given options and output path
     auto run_merge = [&](const std::string &out_path, MergeEngine::Options &chunk_opts,
                          bool reopen_perf = false) {
@@ -426,6 +482,12 @@ int main(int argc, char *argv[]) {
             engine.write_perf_only();
         } else {
             engine.write_viz_only(viz_events);
+        }
+
+        // Write metric counter events (CPU/GPU utilization)
+        if (!metric_samples.empty()) {
+            // Use PID 0 for system-wide metrics (creates a separate process track)
+            write_metrics(*writer, 0);
         }
 
         writer->finalize();

@@ -21,6 +21,7 @@ SRCS := src/main.cpp \
         src/viz_json_reader.cpp \
         src/ftrc_reader.cpp \
         src/merge_engine.cpp \
+        src/metric_csv_reader.cpp \
         src/perfetto_writer.cpp
 
 # libftrc (C library from pyfasttrace)

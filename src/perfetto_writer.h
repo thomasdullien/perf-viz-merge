@@ -57,6 +57,8 @@ public:
         write_bytes(field, sub.data());
     }
 
+    void buf_push(char byte) { buf_.push_back(byte); }
+
     const std::string &data() const { return buf_; }
     size_t size() const { return buf_.size(); }
     void clear() { buf_.clear(); }
@@ -96,6 +98,11 @@ public:
     void write_metadata(std::string_view name_key, int64_t pid, int64_t tid,
                         std::string_view args_json) override;
 
+    // Write a counter (time-series) value on a named counter track.
+    // Creates the counter track descriptor on first use.
+    void write_counter(std::string_view metric_name, double ts_us,
+                       double value, int64_t pid);
+
     uint64_t events_written() const override { return count_; }
 
     void finalize() override;
@@ -122,6 +129,11 @@ private:
     static constexpr int64_t GIL_TID_OFFSET = 100000000;
     static constexpr int64_t SCHED_TID_OFFSET = 200000000;
     static constexpr int64_t GPU_TID_OFFSET = 300000000;
+    static constexpr uint64_t COUNTER_UUID_BASE = 500000000ULL;
+
+    // Counter tracks: metric_name → uuid
+    std::unordered_map<std::string, uint64_t> counter_tracks_;
+    uint64_t next_counter_uuid_ = COUNTER_UUID_BASE;
 
     // Perfetto protobuf field numbers
     struct TracePacketFields {
@@ -144,6 +156,16 @@ private:
         static constexpr uint64_t SLICE_BEGIN = 1;
         static constexpr uint64_t SLICE_END = 2;
         static constexpr uint64_t INSTANT = 3;
+        static constexpr uint64_t COUNTER = 4;
+    };
+
+    // TrackEvent field for double counter values
+    static constexpr uint32_t kTrackEventDoubleCounterValue = 44;
+
+    // TrackDescriptor field for counter descriptor
+    struct CounterDescriptorFields {
+        static constexpr uint32_t counter = 8;  // TrackDescriptor.counter
+        static constexpr uint32_t unit = 3;     // CounterDescriptor.unit
     };
 
     struct TrackDescriptorFields {

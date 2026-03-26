@@ -349,3 +349,67 @@ std::string PerfettoWriter::parse_name_from_args(std::string_view args_json) {
 
     return std::string(args_json.substr(pos, end - pos));
 }
+
+void PerfettoWriter::write_counter(std::string_view metric_name, double ts_us,
+                                    double value, int64_t pid) {
+    std::string key(metric_name);
+    uint64_t uuid;
+
+    auto it = counter_tracks_.find(key);
+    if (it != counter_tracks_.end()) {
+        uuid = it->second;
+    } else {
+        // Create new counter track descriptor
+        uuid = next_counter_uuid_++;
+        counter_tracks_[key] = uuid;
+
+        // Ensure process track exists
+        uint64_t proc_uuid = static_cast<uint64_t>(pid);
+        if (!defined_tracks_.count(proc_uuid)) {
+            emit_process_track(pid, "");
+        }
+
+        // Emit counter track descriptor
+        ProtoEncoder packet;
+        packet.write_nested(TracePacketFields::track_descriptor, [&](ProtoEncoder &td) {
+            td.write_uint64(TrackDescriptorFields::uuid, uuid);
+            td.write_uint64(TrackDescriptorFields::parent_uuid, proc_uuid);
+            td.write_string(TrackDescriptorFields::name, metric_name);
+            // Mark as counter track
+            td.write_nested(CounterDescriptorFields::counter, [&](ProtoEncoder &cd) {
+                // unit = UNSPECIFIED (0) — Perfetto infers from name
+                (void)cd;
+            });
+        });
+        write_packet(packet.data());
+    }
+
+    // Emit counter value
+    uint64_t ts_ns = static_cast<uint64_t>(ts_us * 1000.0);
+
+    ProtoEncoder packet;
+    packet.write_uint64(TracePacketFields::trusted_packet_sequence_id, SEQ_ID);
+    if (!state_cleared_) {
+        state_cleared_ = true;
+        packet.write_uint64(TracePacketFields::sequence_flags, 1);
+    } else {
+        packet.write_uint64(TracePacketFields::sequence_flags, 2);
+    }
+    packet.write_uint64(TracePacketFields::timestamp, ts_ns);
+    packet.write_nested(TracePacketFields::track_event, [&](ProtoEncoder &te) {
+        te.write_uint64(TrackEventFields::type, TrackEventType::COUNTER);
+        te.write_uint64(TrackEventFields::track_uuid, uuid);
+        // double_counter_value is field 44, wire type 1 (64-bit fixed)
+        te.write_tag(kTrackEventDoubleCounterValue, 1);  // wire type 1 = fixed64
+        uint64_t bits;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        // Write raw 8 bytes (little-endian fixed64)
+        for (int i = 0; i < 8; i++) {
+            te.buf_push(static_cast<char>(bits & 0xff));
+            bits >>= 8;
+        }
+    });
+    write_packet(packet.data());
+    count_++;
+}
