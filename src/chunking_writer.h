@@ -70,6 +70,30 @@ public:
         total_events_++;
     }
 
+    void write_child_complete(ChildTrack type, std::string_view name,
+                              std::string_view cat, double ts_us,
+                              double dur_us, int64_t pid, int64_t tid) override {
+        maybe_advance_chunk(ts_us);
+        if (writer_) writer_->write_child_complete(type, name, cat, ts_us, dur_us, pid, tid);
+        total_events_++;
+    }
+
+    void write_child_begin(ChildTrack type, std::string_view name,
+                           std::string_view cat, double ts_us,
+                           int64_t pid, int64_t tid) override {
+        maybe_advance_chunk(ts_us);
+        if (writer_) writer_->write_child_begin(type, name, cat, ts_us, pid, tid);
+        total_events_++;
+    }
+
+    void write_child_end(ChildTrack type, std::string_view name,
+                         std::string_view cat, double ts_us,
+                         int64_t pid, int64_t tid) override {
+        maybe_advance_chunk(ts_us);
+        if (writer_) writer_->write_child_end(type, name, cat, ts_us, pid, tid);
+        total_events_++;
+    }
+
     void write_instant(std::string_view name, std::string_view cat,
                        double ts_us, int64_t pid, int64_t tid,
                        std::string_view scope = "t",

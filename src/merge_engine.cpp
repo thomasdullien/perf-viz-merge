@@ -327,34 +327,10 @@ void MergeEngine::write_metadata() {
         int32_t tgid = tgid_for(tid);
         int sort_base = static_cast<int>(i) * 4;
 
-        // Sort index for the real thread (call stacks) — below sched/GIL/GPU
-        writer_.write_metadata("thread_sort_index", tgid, tid,
-                               fmt::format(R"({{"sort_index":{}}})", sort_base + 3));
-
-        if (opts_.include_sched) {
-            int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
-            std::string sched_name = fmt::format("{} [sched]", base);
-            std::string args = fmt::format(R"({{"name":"{}"}})", sched_name);
-            writer_.write_metadata("thread_name", tgid, sched_tid, args);
-            writer_.write_metadata("thread_sort_index", tgid, sched_tid,
-                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 0));
-        }
-        if (opts_.include_gil) {
-            int64_t gil_tid = static_cast<int64_t>(tid) + GIL_TID_OFFSET;
-            std::string gil_name = fmt::format("{} [GIL]", base);
-            std::string args = fmt::format(R"({{"name":"{}"}})", gil_name);
-            writer_.write_metadata("thread_name", tgid, gil_tid, args);
-            writer_.write_metadata("thread_sort_index", tgid, gil_tid,
-                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 1));
-        }
-        if (opts_.include_gpu) {
-            int64_t gpu_tid = static_cast<int64_t>(tid) + GPU_TID_OFFSET;
-            std::string gpu_name = fmt::format("{} [GPU]", base);
-            std::string args = fmt::format(R"({{"name":"{}"}})", gpu_name);
-            writer_.write_metadata("thread_name", tgid, gpu_tid, args);
-            writer_.write_metadata("thread_sort_index", tgid, gpu_tid,
-                                   fmt::format(R"({{"sort_index":{}}})", sort_base + 2));
-        }
+        // Child tracks (sched/GIL/GPU) are created on-demand by the
+        // PerfettoWriter when write_child_* methods are called.
+        // No metadata or sort_index needed — the writer handles
+        // parent_uuid and sibling_order_rank directly.
     }
 }
 
@@ -412,9 +388,6 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                     sched_switch_off_transition_++;
             }
         }
-        int64_t sched_prev_tid = static_cast<int64_t>(prev_tid) + SCHED_TID_OFFSET;
-        int64_t sched_next_tid = static_cast<int64_t>(next_tid) + SCHED_TID_OFFSET;
-
         // prev_tid is being switched OUT
         if (passes_filter(prev_tgid) && passes_name_filter(prev_tid)) {
             auto it = sched_state_.find(prev_tid);
@@ -425,9 +398,9 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                 if (dur_us > 0) {
                     std::string args = fmt::format(
                         R"({{"cpu":{}}})", it->second.last_cpu);
-                    writer_.write_complete(
-                        "on-cpu", "sched", start_us, dur_us,
-                        prev_tgid, sched_prev_tid, args);
+                    writer_.write_child_complete(
+                        ChildTrack::SCHED, "on-cpu", "sched", start_us, dur_us,
+                        prev_tgid, prev_tid);
                     perf_written_++;
                 }
             }
@@ -454,10 +427,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                     std::string args = fmt::format(
                         R"({{"reason":"{}"}})",
                         prev_state_name(it->second.off_cpu_reason));
-                    writer_.write_complete(
-                        prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                    writer_.write_child_complete(
+                        ChildTrack::SCHED, prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
                         start_us, dur_us,
-                        next_tgid, sched_next_tid, args);
+                        next_tgid, next_tid);
                     perf_written_++;
                 }
             }
@@ -479,8 +452,6 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         int32_t target_tgid = tgid_for(target_tid);
         if (!passes_filter(target_tgid) || !passes_name_filter(target_tid)) return;
 
-        int64_t sched_tid = static_cast<int64_t>(target_tid) + SCHED_TID_OFFSET;
-
         // Wakeup means the target thread is transitioning from sleeping to
         // runnable.  Use this to close any open off-cpu span — it's the
         // most precise switch-in indicator we have with per-process recording.
@@ -496,10 +467,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                 std::string args = fmt::format(
                     R"({{"reason":"{}"}})",
                     prev_state_name(it->second.off_cpu_reason));
-                writer_.write_complete(
-                    prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
+                writer_.write_child_complete(
+                    ChildTrack::SCHED, prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
                     start_us, dur_us,
-                    target_tgid, sched_tid, args);
+                    target_tgid, target_tid);
                 perf_written_++;
             }
             sched_state_[target_tid] = {event.timestamp_ns, true, 0, event.cpu};
@@ -509,7 +480,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         std::string args = fmt::format(
             R"({{"target_tid":{}}})", target_tid);
         writer_.write_instant("sched_wakeup", "sched", ts_us,
-                              target_tgid, sched_tid, "t", args);
+                              target_tgid, target_tid, "t", args);
         perf_written_++;
         break;
     }
@@ -519,13 +490,12 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         int32_t tgid = tgid_for(event.tid);
         if (!passes_filter(tgid) || !passes_name_filter(event.tid)) return;
 
-        int64_t sched_tid = static_cast<int64_t>(event.tid) + SCHED_TID_OFFSET;
         std::string args = fmt::format(
             R"({{"child_pid":{},"child_tid":{}}})",
             event.data.fork.child_pid, event.data.fork.child_tid);
 
         writer_.write_instant("process_fork", "sched", ts_us,
-                              tgid, sched_tid, "t", args);
+                              tgid, event.tid, "t", args);
         perf_written_++;
         break;
     }
@@ -537,10 +507,9 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         // Skip if already acquiring (duplicate probe)
         if (gil_start_.count(event.tid)) break;
 
-        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         gil_start_[event.tid] = event.timestamp_ns;
-        writer_.write_begin("GIL acquire", "gil", ts_us,
-                            event.pid, gil_tid);
+        writer_.write_child_begin(ChildTrack::GIL, "GIL acquire", "gil", ts_us,
+                            event.pid, event.tid);
         perf_written_++;
         break;
     }
@@ -549,11 +518,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid) || !passes_name_filter(event.tid)) return;
 
-        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         auto it = gil_start_.find(event.tid);
         if (it != gil_start_.end()) {
-            writer_.write_end("GIL acquire", "gil", ts_us,
-                              event.pid, gil_tid);
+            writer_.write_child_end(ChildTrack::GIL, "GIL acquire", "gil", ts_us,
+                              event.pid, event.tid);
             perf_written_++;
             gil_start_.erase(it);
         } else {
@@ -562,8 +530,8 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         }
         // Start a "GIL held" span — closed by drop_gil
         gil_held_[event.tid] = event.timestamp_ns;
-        writer_.write_begin("GIL held", "gil", ts_us,
-                            event.pid, gil_tid);
+        writer_.write_child_begin(ChildTrack::GIL, "GIL held", "gil", ts_us,
+                            event.pid, event.tid);
         perf_written_++;
         break;
     }
@@ -572,11 +540,10 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         if (!opts_.include_gil) return;
         if (!passes_filter(event.pid) || !passes_name_filter(event.tid)) return;
 
-        int64_t gil_tid = static_cast<int64_t>(event.tid) + GIL_TID_OFFSET;
         auto it = gil_held_.find(event.tid);
         if (it != gil_held_.end()) {
-            writer_.write_end("GIL held", "gil", ts_us,
-                              event.pid, gil_tid);
+            writer_.write_child_end(ChildTrack::GIL, "GIL held", "gil", ts_us,
+                              event.pid, event.tid);
             perf_written_++;
             gil_held_.erase(it);
         }
@@ -584,8 +551,8 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
     }
 
     // --- NVIDIA CUDA events ---
-    // All GPU/NCCL begin/end events use GPU_TID_OFFSET for a separate
-    // track and gpu_open_ for deduplication (duplicate probes like
+    // All GPU/NCCL begin/end events use ChildTrack::GPU for a separate
+    // child track and gpu_open_ for deduplication (duplicate probes like
     // nvidia:launch + nvidia:launch_1).
     case PerfEventType::NvidiaLaunch:
     case PerfEventType::NvidiaStreamSync:
@@ -625,8 +592,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         // Dedup: skip if this span is already open for this tid
         if (gpu_open_[event.tid].count(name)) break;
         gpu_open_[event.tid].insert(name);
-        int64_t gpu_tid = static_cast<int64_t>(event.tid) + GPU_TID_OFFSET;
-        writer_.write_begin(name, cat, ts_us, tgid, gpu_tid);
+        writer_.write_child_begin(ChildTrack::GPU, name, cat, ts_us, tgid, event.tid);
         perf_written_++;
         break;
     }
@@ -670,8 +636,7 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         auto oit = gpu_open_.find(event.tid);
         if (oit == gpu_open_.end() || !oit->second.count(name)) break;
         oit->second.erase(name);
-        int64_t gpu_tid = static_cast<int64_t>(event.tid) + GPU_TID_OFFSET;
-        writer_.write_end(name, cat, ts_us, tgid, gpu_tid);
+        writer_.write_child_end(ChildTrack::GPU, name, cat, ts_us, tgid, event.tid);
         perf_written_++;
         break;
     }
@@ -704,7 +669,6 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
             // switch-out echo by requiring a minimum gap of 10μs.
             uint64_t gap_ns = event.timestamp_ns - it->second.last_event_ns;
             if (gap_ns > 10000) {  // > 10μs
-                int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
                 double start_us = aligner_.align_perf(it->second.last_event_ns);
                 double dur_us = ts_us - start_us;
                 if (opts_.verbose) {
@@ -715,10 +679,11 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                     std::string args = fmt::format(
                         R"({{"reason":"{}"}})",
                         prev_state_name(it->second.off_cpu_reason));
-                    writer_.write_complete(
+                    writer_.write_child_complete(
+                        ChildTrack::SCHED,
                         prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
                         start_us, dur_us,
-                        tgid, sched_tid, args);
+                        tgid, tid);
                     perf_written_++;
                 }
                 sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
@@ -754,7 +719,6 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
         } else if (!it->second.on_cpu) {
             uint64_t gap_ns = event.timestamp_ns - it->second.last_event_ns;
             if (gap_ns > 10000) {  // > 10μs
-                int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
                 double start_us = aligner_.align_perf(it->second.last_event_ns);
                 double dur_us = ts_us - start_us;
                 if (opts_.verbose) {
@@ -765,10 +729,11 @@ void MergeEngine::emit_perf_event(const PerfEvent &event) {
                     std::string args = fmt::format(
                         R"({{"reason":"{}"}})",
                         prev_state_name(it->second.off_cpu_reason));
-                    writer_.write_complete(
+                    writer_.write_child_complete(
+                        ChildTrack::SCHED,
                         prev_state_name(it->second.off_cpu_reason), "sched.off-cpu",
                         start_us, dur_us,
-                        tgid, sched_tid, args);
+                        tgid, tid);
                     perf_written_++;
                 }
                 sched_state_[tid] = {event.timestamp_ns, true, 0, event.cpu};
@@ -793,24 +758,21 @@ void MergeEngine::flush_sched_state() {
         int32_t tgid = tgid_for(tid);
         if (!passes_filter(tgid) || !passes_name_filter(tid)) continue;
 
-        int64_t sched_tid = static_cast<int64_t>(tid) + SCHED_TID_OFFSET;
         double start_us = aligner_.align_perf(state.last_event_ns);
         double end_us = aligner_.align_perf(last_ts_ns);
         double dur_us = end_us - start_us;
         if (dur_us <= 0) continue;
 
         if (state.on_cpu) {
-            std::string args = fmt::format(R"({{"cpu":{}}})", state.last_cpu);
-            writer_.write_complete("on-cpu", "sched", start_us, dur_us,
-                                   tgid, sched_tid, args);
+            writer_.write_child_complete(
+                ChildTrack::SCHED, "on-cpu", "sched",
+                start_us, dur_us, tgid, tid);
             perf_written_++;
         } else {
-            std::string args = fmt::format(
-                R"({{"reason":"{}"}})",
-                prev_state_name(state.off_cpu_reason));
-            writer_.write_complete(
+            writer_.write_child_complete(
+                ChildTrack::SCHED,
                 prev_state_name(state.off_cpu_reason), "sched.off-cpu",
-                start_us, dur_us, tgid, sched_tid, args);
+                start_us, dur_us, tgid, tid);
             perf_written_++;
         }
     }

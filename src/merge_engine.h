@@ -73,11 +73,6 @@ private:
     // Last perf timestamp for flushing open spans at end
     uint64_t last_perf_ts_ns_ = 0;
 
-    // Synthetic TID offsets for separate tracks
-    static constexpr int64_t GIL_TID_OFFSET   = 100000000;
-    static constexpr int64_t SCHED_TID_OFFSET  = 200000000;
-    static constexpr int64_t GPU_TID_OFFSET    = 300000000;
-
     // Unified scheduler state: per-thread tracking with gap-fill
     struct SchedState {
         uint64_t last_event_ns;  // timestamp of last sched event

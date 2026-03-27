@@ -41,6 +41,24 @@ public:
     void write_metadata(std::string_view name_key, int64_t pid, int64_t tid,
                         std::string_view args_json) override;
 
+    // Child track methods — Chrome JSON doesn't support child tracks,
+    // so just write on the main thread track
+    void write_child_complete(ChildTrack type, std::string_view name,
+                              std::string_view cat, double ts_us,
+                              double dur_us, int64_t pid, int64_t tid) override {
+        write_complete(name, cat, ts_us, dur_us, pid, tid);
+    }
+    void write_child_begin(ChildTrack type, std::string_view name,
+                           std::string_view cat, double ts_us,
+                           int64_t pid, int64_t tid) override {
+        write_begin(name, cat, ts_us, pid, tid);
+    }
+    void write_child_end(ChildTrack type, std::string_view name,
+                         std::string_view cat, double ts_us,
+                         int64_t pid, int64_t tid) override {
+        write_end(name, cat, ts_us, pid, tid);
+    }
+
     uint64_t events_written() const override { return count_; }
 
     void finalize() override;
