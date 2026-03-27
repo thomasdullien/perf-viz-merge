@@ -98,18 +98,8 @@ public:
     void write_metadata(std::string_view name_key, int64_t pid, int64_t tid,
                         std::string_view args_json) override;
 
-    // Child track events (sched/GIL/GPU on a sub-track beneath a thread)
-    void write_child_complete(ChildTrack type, std::string_view name,
-                              std::string_view cat, double ts_us,
-                              double dur_us, int64_t pid, int64_t tid) override;
-    void write_child_begin(ChildTrack type, std::string_view name,
-                           std::string_view cat, double ts_us,
-                           int64_t pid, int64_t tid) override;
-    void write_child_end(ChildTrack type, std::string_view name,
-                         std::string_view cat, double ts_us,
-                         int64_t pid, int64_t tid) override;
-
     // Write a counter (time-series) value on a named counter track.
+    // Creates the counter track descriptor on first use.
     void write_counter(std::string_view metric_name, double ts_us,
                        double value, int64_t pid);
 
@@ -135,16 +125,10 @@ private:
     // Track management
     std::unordered_set<uint64_t> defined_tracks_;
 
-    // UUID scheme (no synthetic TIDs):
-    //   Thread track:  100000000 + tid
-    //   Sched child:   200000000 + tid
-    //   GIL child:     300000000 + tid
-    //   GPU child:     400000000 + tid
-    //   Counter:       500000000+
-    static constexpr uint64_t THREAD_UUID_BASE  = 100000000ULL;
-    static constexpr uint64_t SCHED_UUID_BASE   = 200000000ULL;
-    static constexpr uint64_t GIL_UUID_BASE     = 300000000ULL;
-    static constexpr uint64_t GPU_UUID_BASE     = 400000000ULL;
+    // Synthetic TID offsets (must match merge_engine.h)
+    static constexpr int64_t GIL_TID_OFFSET = 100000000;
+    static constexpr int64_t SCHED_TID_OFFSET = 200000000;
+    static constexpr int64_t GPU_TID_OFFSET = 300000000;
     static constexpr uint64_t COUNTER_UUID_BASE = 500000000ULL;
 
     // Counter tracks: metric_name → uuid
@@ -221,11 +205,11 @@ private:
     // Write a raw TracePacket to the file (wrapped in Trace.packet field 1)
     void write_packet(const std::string &packet_data);
 
-    // Ensure thread track exists and return its UUID
-    uint64_t ensure_thread_track(int64_t pid, int64_t tid);
+    // Compute track UUID from pid/tid (including synthetic TID detection)
+    uint64_t track_uuid_for(int64_t pid, int64_t tid);
 
-    // Ensure child track exists and return its UUID
-    uint64_t ensure_child_track(ChildTrack type, int64_t pid, int64_t tid);
+    // Ensure a track descriptor has been emitted for this pid/tid
+    void ensure_track(int64_t pid, int64_t tid);
 
     // Emit a process track descriptor
     void emit_process_track(int64_t pid, std::string_view name);
@@ -233,10 +217,9 @@ private:
     // Emit a thread track descriptor
     void emit_thread_track(int64_t pid, int64_t tid, std::string_view name);
 
-    // Emit a child track descriptor (for sched/GIL/GPU sub-tracks)
+    // Emit a child track descriptor (for sched/GIL sub-tracks)
     void emit_child_track(uint64_t uuid, uint64_t parent_uuid,
-                          std::string_view name, int32_t sort_rank,
-                          int64_t pid, int64_t tid);
+                          std::string_view name, int32_t sort_rank);
 
     // Get or create interned ID for an event name; writes interning data to encoder
     uint64_t intern_event_name(const std::string &name, ProtoEncoder &interned);
@@ -244,16 +227,10 @@ private:
     // Get or create interned ID for a category; writes interning data to encoder
     uint64_t intern_category(const std::string &cat, ProtoEncoder &interned);
 
-    // Write a track event on a thread track
+    // Write a track event packet
     void write_track_event(std::string_view name, std::string_view cat,
                            double ts_us, int64_t pid, int64_t tid,
                            uint64_t event_type);
-
-    // Write a track event on a child track
-    void write_child_track_event(ChildTrack type, std::string_view name,
-                                 std::string_view cat, double ts_us,
-                                 int64_t pid, int64_t tid,
-                                 uint64_t event_type);
 
     // Parse a name from metadata args JSON (e.g., {"name":"foo"})
     static std::string parse_name_from_args(std::string_view args_json);
