@@ -103,7 +103,7 @@ struct VizEvent {
     int64_t pid;
     int64_t tid;
     char ph;            // phase: B, E, X, i, etc.
-    int depth;          // call stack depth (0 = top-level, -1 = unknown)
+    int depth = -1;     // call stack depth (0 = top-level, -1 = unknown)
     std::string name;
     std::string cat;
     std::string args_json; // raw JSON string of args
