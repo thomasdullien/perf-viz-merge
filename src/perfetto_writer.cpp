@@ -141,16 +141,22 @@ void PerfettoWriter::emit_child_track(uint64_t uuid, uint64_t parent_uuid,
                                        std::string_view name,
                                        int32_t sort_rank,
                                        int64_t pid, int64_t tid) {
+    // Perfetto merges tracks with the same (pid,tid) in ThreadDescriptor,
+    // so child tracks need a unique synthetic TID to stay separate.
+    // The UUID already encodes the type (200M/300M/400M + tid), so we
+    // use it directly as the fake TID. The name field provides the
+    // human-readable label in the UI.
+    int64_t fake_tid = static_cast<int64_t>(uuid);
+
     ProtoEncoder packet;
     packet.write_nested(TracePacketFields::track_descriptor, [&](ProtoEncoder &td) {
         td.write_uint64(TrackDescriptorFields::uuid, uuid);
-        td.write_uint64(TrackDescriptorFields::parent_uuid, parent_uuid);
         td.write_string(TrackDescriptorFields::name, name);
         td.write_int64(TrackDescriptorFields::sibling_order_rank, sort_rank);
-        // Associate with the same thread so Perfetto groups them together
         td.write_nested(TrackDescriptorFields::thread, [&](ProtoEncoder &thd) {
             thd.write_int64(ThreadDescriptorFields::pid, pid);
-            thd.write_int64(ThreadDescriptorFields::tid, tid);
+            thd.write_int64(ThreadDescriptorFields::tid, fake_tid);
+            thd.write_string(ThreadDescriptorFields::thread_name, name);
         });
     });
     write_packet(packet.data());
