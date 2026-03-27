@@ -226,6 +226,23 @@ else
 fi
 
 # ----------------------------------------
+# Test 7: Synthetic trace tests (ftrc + multi-event perf.data)
+# ----------------------------------------
+echo ""
+echo "--- Test 7: Synthetic trace tests ---"
+
+if command -v trace_processor_shell &>/dev/null; then
+    if PERF_VIZ_MERGE="$BINARY" python3 "$SCRIPT_DIR/test_synthetic_trace.py" 2>"$TEST_OUTPUT_DIR/synth_stderr.txt"; then
+        pass "Synthetic trace tests passed"
+    else
+        fail "Synthetic trace tests failed (see $TEST_OUTPUT_DIR/synth_stderr.txt)"
+        tail -20 "$TEST_OUTPUT_DIR/synth_stderr.txt"
+    fi
+else
+    skip "Synthetic trace tests require trace_processor_shell"
+fi
+
+# ----------------------------------------
 # Summary
 # ----------------------------------------
 echo ""
