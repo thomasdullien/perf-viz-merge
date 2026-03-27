@@ -155,18 +155,17 @@ def test_call_stacks(output: str, result: TestResult):
         result.check(func in found_names,
                      f"Function '{func}' found in slices")
 
-    # Check that there are events from all 3 threads
+    # Check that there are events from all 3 threads (via global track names)
     thread_rows = tp_query_rows(output,
-        "SELECT DISTINCT thread.tid "
-        "FROM slice JOIN thread_track ON slice.track_id = thread_track.id "
-        "JOIN thread ON thread_track.utid = thread.id "
-        "WHERE thread.tid IN (1000, 1001, 1002)")
-    thread_tids = {int(r["tid"]) for r in thread_rows}
-    result.check(TID_MAIN in thread_tids,
+        "SELECT DISTINCT track.name "
+        "FROM slice JOIN track ON slice.track_id = track.id "
+        "WHERE track.name LIKE 'stacks [%]'")
+    track_names = {r["name"] for r in thread_rows}
+    result.check(f"stacks [{TID_MAIN}]" in track_names,
                  "MainThread (tid=1000) has slices")
-    result.check(TID_MCPROC0 in thread_tids,
+    result.check(f"stacks [{TID_MCPROC0}]" in track_names,
                  "mcproc__0 (tid=1001) has slices")
-    result.check(TID_MCPROC1 in thread_tids,
+    result.check(f"stacks [{TID_MCPROC1}]" in track_names,
                  "mcproc__1 (tid=1002) has slices")
 
 
@@ -183,10 +182,10 @@ def test_sched_events(output: str, result: TestResult):
         "SELECT count(*) FROM slice WHERE name LIKE 'Sleeping%'")
     result.check(off_cpu > 0, f"off-cpu (Sleeping) slices exist ({off_cpu})")
 
-    # Check sched track exists
-    sched_threads = tp_query_rows(output,
-        "SELECT DISTINCT thread.name FROM thread WHERE thread.name = 'sched'")
-    result.check(len(sched_threads) > 0, "sched tracks exist")
+    # Check sched track exists (global track model: "sched [TID]")
+    sched_tracks = tp_query_rows(output,
+        "SELECT DISTINCT track.name FROM track WHERE track.name LIKE 'sched [%]'")
+    result.check(len(sched_tracks) > 0, "sched tracks exist")
 
 
 def test_gil_events(output: str, result: TestResult):
@@ -201,10 +200,10 @@ def test_gil_events(output: str, result: TestResult):
         "SELECT count(*) FROM slice WHERE name = 'GIL held'")
     result.check(held > 0, f"GIL held slices exist ({held})")
 
-    # Check GIL track exists
-    gil_threads = tp_query_rows(output,
-        "SELECT DISTINCT thread.name FROM thread WHERE thread.name = 'GIL'")
-    result.check(len(gil_threads) > 0, "GIL tracks exist")
+    # Check GIL track exists (global track model: "GIL [TID]")
+    gil_tracks = tp_query_rows(output,
+        "SELECT DISTINCT track.name FROM track WHERE track.name LIKE 'GIL [%]'")
+    result.check(len(gil_tracks) > 0, "GIL tracks exist")
 
 
 def test_gpu_events(output: str, result: TestResult):
@@ -219,36 +218,40 @@ def test_gpu_events(output: str, result: TestResult):
         "SELECT count(*) FROM slice WHERE name = 'cuStreamSynchronize'")
     result.check(sync > 0, f"cuStreamSynchronize slices exist ({sync})")
 
-    # Check GPU track exists
-    gpu_threads = tp_query_rows(output,
-        "SELECT DISTINCT thread.name FROM thread WHERE thread.name = 'GPU'")
-    result.check(len(gpu_threads) > 0, "GPU tracks exist")
+    # Check GPU track exists (global track model: "GPU [TID]")
+    gpu_tracks = tp_query_rows(output,
+        "SELECT DISTINCT track.name FROM track WHERE track.name LIKE 'GPU [%]'")
+    result.check(len(gpu_tracks) > 0, "GPU tracks exist")
 
 
 def test_thread_names(output: str, result: TestResult):
-    """Test 6: Thread names are present."""
+    """Test 6: Thread and process names are present in track hierarchy."""
     print("\n--- Test 6: Thread names ---")
 
+    # With global tracks, thread groups are named "ThreadName [TID]"
     rows = tp_query_rows(output,
-        "SELECT thread.tid, thread.name FROM thread "
-        "WHERE thread.tid IN (1000, 1001, 1002)")
-    tid_names = {int(r["tid"]): r["name"] for r in rows}
+        "SELECT track.name FROM track "
+        "WHERE track.name LIKE 'MainThread%' "
+        "   OR track.name LIKE 'mcproc__%'")
+    track_names = [r["name"] for r in rows]
 
-    # The perf COMM events set names to "python3"
-    result.check(TID_MAIN in tid_names,
-                 f"Thread 1000 exists (name='{tid_names.get(TID_MAIN, 'N/A')}')")
-    result.check(TID_MCPROC0 in tid_names,
-                 f"Thread 1001 exists (name='{tid_names.get(TID_MCPROC0, 'N/A')}')")
-    result.check(TID_MCPROC1 in tid_names,
-                 f"Thread 1002 exists (name='{tid_names.get(TID_MCPROC1, 'N/A')}')")
+    has_main = any(f"[{TID_MAIN}]" in n for n in track_names)
+    has_mc0 = any(f"[{TID_MCPROC0}]" in n for n in track_names)
+    has_mc1 = any(f"[{TID_MCPROC1}]" in n for n in track_names)
 
-    # Process name
+    result.check(has_main,
+                 f"Thread 1000 exists (name='MainThread [{TID_MAIN}]')")
+    result.check(has_mc0,
+                 f"Thread 1001 exists (name='mcproc__0 [{TID_MCPROC0}]')")
+    result.check(has_mc1,
+                 f"Thread 1002 exists (name='mcproc__1 [{TID_MCPROC1}]')")
+
+    # Process name: process group track is named "python3 [PID]"
     proc_rows = tp_query_rows(output,
-        "SELECT DISTINCT process.name FROM process "
-        "WHERE process.name IS NOT NULL AND process.name != ''")
-    proc_names = {r["name"] for r in proc_rows}
-    result.check("python3" in proc_names,
-                 f"Process 'python3' exists in process table")
+        "SELECT track.name FROM track "
+        "WHERE track.name LIKE 'python3 [%]'")
+    result.check(len(proc_rows) > 0,
+                 "Process 'python3' exists in track hierarchy")
 
 
 def test_no_misplaced_events(output: str, result: TestResult):

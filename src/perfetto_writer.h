@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -9,6 +10,19 @@
 #include <vector>
 
 #include "output_writer.h"
+
+// Distinct type for Perfetto track UUIDs to avoid mixing with raw ints.
+enum class TrackUUID : uint64_t {};
+
+inline TrackUUID make_track_uuid(uint64_t v) { return static_cast<TrackUUID>(v); }
+inline uint64_t  raw(TrackUUID u)            { return static_cast<uint64_t>(u); }
+
+// Hash support for use in unordered containers.
+struct TrackUUIDHash {
+    size_t operator()(TrackUUID u) const noexcept {
+        return std::hash<uint64_t>{}(raw(u));
+    }
+};
 
 // Hand-encoded protobuf writer for Perfetto's native trace format.
 // No protobuf library dependency — encodes wire format directly.
@@ -107,6 +121,31 @@ public:
 
     void finalize() override;
 
+    // Perfetto protobuf field numbers (public for emit_global_track helper)
+    struct TracePacketFields {
+        static constexpr uint32_t timestamp = 8;
+        static constexpr uint32_t track_event = 11;
+        static constexpr uint32_t track_descriptor = 60;
+        static constexpr uint32_t trusted_packet_sequence_id = 10;
+        static constexpr uint32_t sequence_flags = 13;
+        static constexpr uint32_t interned_data = 12;
+    };
+
+    struct TrackDescriptorFields {
+        static constexpr uint32_t uuid = 1;
+        static constexpr uint32_t parent_uuid = 5;
+        static constexpr uint32_t name = 2;
+        static constexpr uint32_t process = 3;
+        static constexpr uint32_t thread = 4;
+        static constexpr uint32_t child_ordering = 11;
+        static constexpr uint32_t sibling_order_rank = 12;
+    };
+
+    static constexpr uint64_t CHILD_ORDERING_EXPLICIT = 3;
+
+    // Write a raw TracePacket to the file
+    void write_packet(const std::string &packet_data);
+
 private:
     FILE *out_ = nullptr;
     uint64_t count_ = 0;
@@ -123,27 +162,42 @@ private:
     uint64_t next_cat_iid_ = 1;
 
     // Track management
-    std::unordered_set<uint64_t> defined_tracks_;
+    std::unordered_set<TrackUUID, TrackUUIDHash> defined_tracks_;
+
+    // Deferred track descriptors for process and thread groups.
+    // We buffer these so that metadata (real names) can arrive before we emit.
+    // Emitted once at finalize().
+    struct DeferredTrack {
+        TrackUUID uuid;
+        TrackUUID parent_uuid;
+        std::string fallback_name;  // e.g. "Process 1000"
+        int32_t sibling_order_rank = 0;
+        bool child_ordering_explicit = false;
+    };
+    // Key: raw UUID -> deferred descriptor
+    std::unordered_map<uint64_t, DeferredTrack> deferred_tracks_;
+    // Metadata names: raw UUID -> display name (set by write_metadata)
+    std::unordered_map<uint64_t, std::string> metadata_names_;
+
+    // Flush all deferred track descriptors (called from finalize)
+    void flush_deferred_tracks();
 
     // Synthetic TID offsets (must match merge_engine.h)
     static constexpr int64_t GIL_TID_OFFSET = 100000000;
     static constexpr int64_t SCHED_TID_OFFSET = 200000000;
     static constexpr int64_t GPU_TID_OFFSET = 300000000;
+
+    // UUID base offsets for each track type
+    static constexpr uint64_t THREAD_UUID_BASE  = 100000000ULL;
+    static constexpr uint64_t SCHED_UUID_BASE   = 200000000ULL;
+    static constexpr uint64_t GIL_UUID_BASE     = 300000000ULL;
+    static constexpr uint64_t GPU_UUID_BASE     = 400000000ULL;
     static constexpr uint64_t COUNTER_UUID_BASE = 500000000ULL;
+    static constexpr uint64_t GROUP_UUID_BASE   = 600000000ULL;
 
     // Counter tracks: metric_name → uuid
-    std::unordered_map<std::string, uint64_t> counter_tracks_;
-    uint64_t next_counter_uuid_ = COUNTER_UUID_BASE;
-
-    // Perfetto protobuf field numbers
-    struct TracePacketFields {
-        static constexpr uint32_t timestamp = 8;
-        static constexpr uint32_t track_event = 11;
-        static constexpr uint32_t track_descriptor = 60;
-        static constexpr uint32_t trusted_packet_sequence_id = 10;
-        static constexpr uint32_t sequence_flags = 13;
-        static constexpr uint32_t interned_data = 12;
-    };
+    std::unordered_map<std::string, TrackUUID> counter_tracks_;
+    uint64_t next_counter_uuid_raw_ = COUNTER_UUID_BASE;
 
     struct TrackEventFields {
         static constexpr uint32_t type = 9;
@@ -159,34 +213,11 @@ private:
         static constexpr uint64_t COUNTER = 4;
     };
 
-    // TrackEvent field for double counter values
     static constexpr uint32_t kTrackEventDoubleCounterValue = 44;
 
-    // TrackDescriptor field for counter descriptor
     struct CounterDescriptorFields {
-        static constexpr uint32_t counter = 8;  // TrackDescriptor.counter
-        static constexpr uint32_t unit = 3;     // CounterDescriptor.unit
-    };
-
-    struct TrackDescriptorFields {
-        static constexpr uint32_t uuid = 1;
-        static constexpr uint32_t parent_uuid = 5;
-        static constexpr uint32_t name = 2;
-        static constexpr uint32_t process = 3;
-        static constexpr uint32_t thread = 4;
-        static constexpr uint32_t child_ordering = 11;
-        static constexpr uint32_t sibling_order_rank = 12;
-    };
-
-    struct ProcessDescriptorFields {
-        static constexpr uint32_t pid = 1;
-        static constexpr uint32_t process_name = 6;
-    };
-
-    struct ThreadDescriptorFields {
-        static constexpr uint32_t pid = 1;
-        static constexpr uint32_t tid = 2;
-        static constexpr uint32_t thread_name = 5;
+        static constexpr uint32_t counter = 8;
+        static constexpr uint32_t unit = 3;
     };
 
     struct InternedDataFields {
@@ -199,27 +230,17 @@ private:
         static constexpr uint32_t name = 2;
     };
 
-    // child_ordering enum values
-    static constexpr uint64_t CHILD_ORDERING_EXPLICIT = 1;
-
-    // Write a raw TracePacket to the file (wrapped in Trace.packet field 1)
-    void write_packet(const std::string &packet_data);
-
     // Compute track UUID from pid/tid (including synthetic TID detection)
-    uint64_t track_uuid_for(int64_t pid, int64_t tid);
+    TrackUUID track_uuid_for(int64_t pid, int64_t tid);
 
     // Ensure a track descriptor has been emitted for this pid/tid
     void ensure_track(int64_t pid, int64_t tid);
 
-    // Emit a process track descriptor
-    void emit_process_track(int64_t pid, std::string_view name);
+    // Ensure the process-level group track exists
+    void ensure_process_group(int64_t pid);
 
-    // Emit a thread track descriptor
-    void emit_thread_track(int64_t pid, int64_t tid, std::string_view name);
-
-    // Emit a child track descriptor (for sched/GIL sub-tracks)
-    void emit_child_track(uint64_t uuid, uint64_t parent_uuid,
-                          std::string_view name, int32_t sort_rank);
+    // Ensure the per-thread group track exists (parent of sched/GIL/GPU/stacks)
+    void ensure_thread_group(int64_t pid, int64_t real_tid);
 
     // Get or create interned ID for an event name; writes interning data to encoder
     uint64_t intern_event_name(const std::string &name, ProtoEncoder &interned);

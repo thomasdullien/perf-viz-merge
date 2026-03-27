@@ -16,3 +16,4 @@ merged.perfetto-trace
 perf.data
 perf.data.old
 *.swp
+*.pyc
