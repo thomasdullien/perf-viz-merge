@@ -18,7 +18,6 @@ LDFLAGS  += -lelf -ldw
 
 SRCS := src/main.cpp \
         src/perf_data_reader.cpp \
-        src/viz_json_reader.cpp \
         src/ftrc_reader.cpp \
         src/merge_engine.cpp \
         src/metric_csv_reader.cpp \

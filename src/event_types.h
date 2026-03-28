@@ -109,6 +109,16 @@ struct VizEvent {
     std::string args_json; // raw JSON string of args
 };
 
+// Abstract iterator for consuming viz events in sorted order.
+// Mirrors PerfEventIterator from streaming_sort.h.
+class VizEventIterator {
+public:
+    virtual ~VizEventIterator() = default;
+    virtual bool has_next() const = 0;
+    virtual const VizEvent &peek() const = 0;
+    virtual void advance() = 0;
+};
+
 // Chrome Trace output event (used by TraceWriter).
 struct TraceOutputEvent {
     double ts_us;

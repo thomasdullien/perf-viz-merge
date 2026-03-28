@@ -20,49 +20,12 @@
 #include "perf_data_reader.h"
 #include "perfetto_writer.h"
 #include "chunking_writer.h"
+#include "kway_viz_merge.h"
 #include "metric_csv_reader.h"
 #include "streaming_sort.h"
-#include "viz_json_reader.h"
 
-// Close any open B (begin) events left at the end of a trace file by
-// appending synthetic E (end) events.  Without this, unclosed call stacks
-// from one file bleed into the next file on the same tid.
-static void close_open_stacks(std::vector<VizEvent> &events, size_t start_idx) {
-    // Build per-tid stack of open B events (index into events vector)
-    std::unordered_map<int64_t, std::vector<size_t>> stacks;
-
-    for (size_t i = start_idx; i < events.size(); i++) {
-        const auto &e = events[i];
-        if (e.ph == 'B') {
-            stacks[e.tid].push_back(i);
-        } else if (e.ph == 'E') {
-            auto &st = stacks[e.tid];
-            if (!st.empty()) st.pop_back();
-        }
-        // X events are self-contained, no stack effect
-    }
-
-    // Find the last timestamp in this file's events
-    double last_ts = 0;
-    for (size_t i = start_idx; i < events.size(); i++) {
-        if (events[i].ts_us > last_ts) last_ts = events[i].ts_us;
-    }
-
-    // Emit synthetic E events for each unclosed B, in reverse stack order
-    for (auto &[tid, st] : stacks) {
-        for (auto it = st.rbegin(); it != st.rend(); ++it) {
-            VizEvent close;
-            close.ts_us = last_ts;
-            close.dur_us = 0;
-            close.pid = events[*it].pid;
-            close.tid = tid;
-            close.ph = 'E';
-            close.name = events[*it].name;
-            close.cat = events[*it].cat;
-            events.push_back(std::move(close));
-        }
-    }
-}
+// close_open_stacks() removed — libftrc handles entry/exit pairing
+// internally, so ftrc events are always properly closed.
 
 static void usage(const char *prog) {
     fmt::print(stderr,
@@ -290,84 +253,44 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Read VizTracer events
-    std::vector<VizEvent> viz_events;
+    // --- Pre-scan ftrc files (streaming, O(1) memory per file) ---
+    // Collect metadata events, min/max timestamps, and TID→PID mappings
+    // without loading all events into memory.
 
-    // Pre-estimate capacity from file sizes to avoid repeated reallocations.
-    // For ftrc files: ~12 bytes/raw event, ~2 raw events per completed event,
-    // plus header overhead. Rough estimate: file_size / 24.
-    {
-        size_t estimated = 0;
-        for (const auto &vp : viz_paths) {
-            struct stat st;
-            if (stat(vp.c_str(), &st) == 0) {
-                estimated += static_cast<size_t>(st.st_size) / 24;
-            }
-        }
-        if (estimated > 0) {
-            viz_events.reserve(estimated);
-        }
-    }
+    double viz_first = std::numeric_limits<double>::max();
+    double viz_last = std::numeric_limits<double>::lowest();
+    std::vector<VizEvent> viz_metadata;
+    std::unordered_map<int64_t, int32_t> viz_tid_to_pid;
+    bool has_viz = !viz_paths.empty();
 
     for (const auto &viz_path : viz_paths) {
         if (opts.verbose) {
-            fmt::print(stderr, "Reading trace data from {}\n", viz_path);
+            fmt::print(stderr, "Pre-scanning {}\n", viz_path);
         }
-
-        size_t before = viz_events.size();
         try {
-            // Detect file type by extension
-            bool is_ftrc = viz_path.size() >= 5 &&
-                           viz_path.substr(viz_path.size() - 5) == ".ftrc";
-
-            if (is_ftrc) {
-                FtrcReader reader(viz_path);
-                reader.read_all_events([&](const VizEvent &event) {
-                    viz_events.push_back(event);
-                });
-                if (opts.verbose) {
-                    fmt::print(stderr, "Read {} events from {} (ftrc)\n",
-                               reader.event_count(), viz_path);
+            FtrcReader scanner(viz_path);
+            scanner.read_all_events([&](const VizEvent &ev) {
+                if (ev.ts_us < viz_first) viz_first = ev.ts_us;
+                if (ev.ts_us > viz_last) viz_last = ev.ts_us;
+                if (ev.ph == 'M') {
+                    viz_metadata.push_back(ev);
                 }
-            } else {
-                VizJsonReader reader(viz_path);
-                reader.read_all_events([&](const VizEvent &event) {
-                    viz_events.push_back(event);
-                });
-                if (opts.verbose) {
-                    fmt::print(stderr, "Read {} events from {} (json)\n",
-                               reader.event_count(), viz_path);
-                }
+                viz_tid_to_pid[ev.tid] = static_cast<int32_t>(ev.pid);
+            });
+            if (opts.verbose) {
+                fmt::print(stderr, "  {} events scanned from {}\n",
+                           scanner.event_count(), viz_path);
             }
         } catch (const std::exception &e) {
-            fmt::print(stderr, "Error reading trace data from {}: {}\n",
-                       viz_path, e.what());
+            fmt::print(stderr, "Error scanning {}: {}\n", viz_path, e.what());
             return 1;
-        }
-
-        // Close any call stacks left open at the end of this file
-        // so they don't bleed into the next file's events.
-        if (viz_events.size() > before) {
-            size_t before_close = viz_events.size();
-            close_open_stacks(viz_events, before);
-            if (opts.verbose && viz_events.size() > before_close) {
-                fmt::print(stderr, "  Closed {} open call stacks\n",
-                           viz_events.size() - before_close);
-            }
         }
     }
 
     // Auto-detect clock alignment if both sources are present
-    if (has_perf && !viz_events.empty() && !has_time_offset) {
+    if (has_perf && has_viz && !has_time_offset) {
         uint64_t perf_first = perf_min_ts;
         uint64_t perf_last = perf_max_ts;
-
-        double viz_first = viz_events.front().ts_us;
-        double viz_last = viz_events.front().ts_us;
-        for (const auto &e : viz_events) {
-            if (e.ts_us < viz_first) viz_first = e.ts_us;
-            if (e.ts_us > viz_last) viz_last = e.ts_us;
-        }
 
         if (opts.verbose) {
             double pf_us = static_cast<double>(perf_first) / 1000.0;
@@ -377,7 +300,7 @@ int main(int argc, char *argv[]) {
             fmt::print(stderr, "Viz   timestamps: {:.3f} - {:.3f} us (range {:.1f}s)\n",
                        viz_first, viz_last, (viz_last - viz_first) / 1e6);
             fmt::print(stderr, "Start difference: {:.3f}s (perf - viz)\n",
-                       (pf_us - viz_first) / 1e6);
+                       (static_cast<double>(perf_first) / 1000.0 - viz_first) / 1e6);
         }
 
         aligner.detect(static_cast<double>(perf_first),
@@ -390,23 +313,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Sort viz events by (ts, depth, tid, -dur).
-    // - ts: chronological order
-    // - depth: parents (lower depth) before children at the same timestamp,
-    //   ensuring correct nesting in Perfetto BEGIN/END output
-    // - tid: events from different threads at the same (ts, depth) maintain
-    //   stable per-thread ordering, preventing cross-thread mispairing in
-    //   context span reconstruction
-    // - -dur: fallback for events without depth info (depth=-1)
-    std::sort(viz_events.begin(), viz_events.end(),
-              [](const VizEvent &a, const VizEvent &b) {
-                  if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
-                  if (a.depth >= 0 && b.depth >= 0) {
-                      if (a.depth != b.depth) return a.depth < b.depth;
-                      if (a.tid != b.tid) return a.tid < b.tid;
-                  }
-                  return a.dur_us > b.dur_us;
-              });
+    // --- Open ftrc files for streaming k-way merge ---
+    // Each file is re-opened for pull-based iteration. The kernel
+    // page cache means this second pass is fast (no disk I/O).
+
+    std::vector<std::unique_ptr<FtrcReader>> ftrc_readers;
+    KWayVizMerge kway_merge;
+
+    for (const auto &viz_path : viz_paths) {
+        auto reader = std::make_unique<FtrcReader>(viz_path);
+        kway_merge.add_source(reader.get());
+        ftrc_readers.push_back(std::move(reader));
+    }
+
+    if (has_viz) {
+        kway_merge.initialize();
+        if (opts.verbose) {
+            fmt::print(stderr, "K-way merge initialized with {} sources\n",
+                       ftrc_readers.size());
+        }
+    }
 
     // Load metric CSV files (if provided)
     std::vector<MetricSample> metric_samples;
@@ -481,17 +407,22 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (has_perf && !viz_paths.empty()) {
-            engine.merge_viz_events(viz_events);
+        // Set pre-scanned metadata
+        if (has_viz) {
+            engine.set_viz_metadata(viz_metadata, viz_tid_to_pid,
+                                    viz_first, viz_last);
+        }
+
+        if (has_perf && has_viz) {
+            engine.merge_viz_events(kway_merge);
         } else if (has_perf) {
             engine.write_perf_only();
-        } else {
-            engine.write_viz_only(viz_events);
+        } else if (has_viz) {
+            engine.write_viz_only(kway_merge);
         }
 
         // Write metric counter events (CPU/GPU utilization)
         if (!metric_samples.empty()) {
-            // Use PID 0 for system-wide metrics (creates a separate process track)
             write_metrics(*writer, 0);
         }
 
@@ -530,10 +461,11 @@ int main(int argc, char *argv[]) {
                 if (pmin < global_min_us) global_min_us = pmin;
                 if (pmax > global_max_us) global_max_us = pmax;
             }
-            for (const auto &ve : viz_events) {
-                double ts = aligner.align_viz(ve.ts_us);
-                if (ts < global_min_us) global_min_us = ts;
-                if (ts > global_max_us) global_max_us = ts;
+            if (has_viz) {
+                double vmin = aligner.align_viz(viz_first);
+                double vmax = aligner.align_viz(viz_last);
+                if (vmin < global_min_us) global_min_us = vmin;
+                if (vmax > global_max_us) global_max_us = vmax;
             }
 
             if (global_min_us > global_max_us) {
@@ -571,12 +503,17 @@ int main(int argc, char *argv[]) {
                                        fork_events, perf_max_ts);
             }
 
-            if (has_perf && !viz_paths.empty()) {
-                engine.merge_viz_events(viz_events);
+            if (has_viz) {
+                engine.set_viz_metadata(viz_metadata, viz_tid_to_pid,
+                                        viz_first, viz_last);
+            }
+
+            if (has_perf && has_viz) {
+                engine.merge_viz_events(kway_merge);
             } else if (has_perf) {
                 engine.write_perf_only();
-            } else {
-                engine.write_viz_only(viz_events);
+            } else if (has_viz) {
+                engine.write_viz_only(kway_merge);
             }
 
             chunker->finalize();

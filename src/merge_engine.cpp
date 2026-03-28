@@ -940,6 +940,150 @@ void MergeEngine::write_perf_only() {
     }
 }
 
+// --- Streaming iterator overloads ---
+
+void MergeEngine::set_viz_metadata(
+        const std::vector<VizEvent> &metadata_events,
+        const std::unordered_map<int64_t, int32_t> &tid_to_pid,
+        double viz_min_ts_us, double viz_max_ts_us) {
+    // Populate tid_to_tgid_ from pre-scanned data
+    for (const auto &[tid, pid] : tid_to_pid) {
+        tid_to_tgid_[static_cast<int32_t>(tid)] = pid;
+    }
+    // Populate viz_name_map_ from metadata events
+    for (const auto &ve : metadata_events) {
+        if (ve.ph != 'M') continue;
+        if (ve.name != "thread_name" && ve.name != "process_name") continue;
+        auto pos = ve.args_json.find("\"name\":\"");
+        if (pos == std::string::npos) continue;
+        pos += 8;
+        auto end = ve.args_json.find('"', pos);
+        if (end == std::string::npos) continue;
+        std::string name = ve.args_json.substr(pos, end - pos);
+        viz_name_map_[ve.tid] = name;
+        if (ve.name == "process_name")
+            viz_name_map_[ve.pid] = name;
+    }
+    if (opts_.verbose && !viz_name_map_.empty()) {
+        fmt::print(stderr, "Built viz name map with {} entries\n", viz_name_map_.size());
+        for (const auto &[id, name] : viz_name_map_)
+            fmt::print(stderr, "  tid/pid {} -> \"{}\"\n", id, name);
+    }
+    // Compute time bounds from pre-scanned min/max
+    if (opts_.time_start_s >= 0 || opts_.time_end_s >= 0) {
+        double min_ts = viz_min_ts_us;
+        if (perf_iter_ && perf_iter_->has_next()) {
+            double perf_start = aligner_.align_perf(perf_iter_->peek().timestamp_ns);
+            if (perf_start < min_ts) min_ts = perf_start;
+        }
+        if (opts_.time_start_s >= 0)
+            time_start_us_ = min_ts + opts_.time_start_s * 1e6;
+        if (opts_.time_end_s >= 0)
+            time_end_us_ = min_ts + opts_.time_end_s * 1e6;
+        if (opts_.verbose) {
+            fmt::print(stderr, "Time range filter: trace starts at {:.3f} us\n", min_ts);
+            if (time_start_us_ >= 0)
+                fmt::print(stderr, "  start: +{:.3f}s -> {:.3f} us\n", opts_.time_start_s, time_start_us_);
+            if (time_end_us_ >= 0)
+                fmt::print(stderr, "  end:   +{:.3f}s -> {:.3f} us\n", opts_.time_end_s, time_end_us_);
+        }
+    }
+}
+
+void MergeEngine::merge_viz_events(VizEventIterator &viz_iter) {
+    write_metadata();
+
+    while ((perf_iter_ && perf_iter_->has_next()) || viz_iter.has_next()) {
+        bool emit_perf = false;
+
+        if (!perf_iter_ || !perf_iter_->has_next()) {
+            emit_perf = false;
+        } else if (!viz_iter.has_next()) {
+            emit_perf = true;
+        } else {
+            double perf_us = aligner_.align_perf(perf_iter_->peek().timestamp_ns);
+            double viz_us = aligner_.align_viz(viz_iter.peek().ts_us);
+            emit_perf = (perf_us <= viz_us);
+        }
+
+        if (emit_perf) {
+            emit_perf_event(perf_iter_->peek());
+            perf_iter_->advance();
+            if (opts_.verbose) maybe_report_progress();
+        } else {
+            const VizEvent &ve = viz_iter.peek();
+            double ts = aligner_.align_viz(ve.ts_us);
+
+            if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+                passes_name_filter(static_cast<int32_t>(ve.tid)) &&
+                passes_time_filter(ts) &&
+                (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
+                std::string_view args = ve.args_json.empty() ? "{}" :
+                    std::string_view(ve.args_json);
+                std::string_view cat = ve.cat.empty() ? "python" :
+                    std::string_view(ve.cat);
+
+                std::string_view event_name = ve.name;
+                std::string cleaned_name;
+                if (event_name.substr(0, 11) == "THREAD_MAP:") {
+                    cleaned_name = clean_thread_map_name(event_name);
+                    event_name = cleaned_name;
+                }
+
+                writer_.write_viz_event(ve.ph, event_name, cat,
+                                        ts, ve.dur_us, ve.pid, ve.tid, args);
+                viz_written_++;
+            }
+            viz_iter.advance();
+            if (opts_.verbose) maybe_report_progress();
+        }
+    }
+
+    flush_sched_state();
+
+    if (opts_.verbose) {
+        fmt::print(stderr, "\n");
+        fmt::print(stderr, "Wrote {} perf events and {} viz events\n",
+                   perf_written_, viz_written_);
+    }
+}
+
+void MergeEngine::write_viz_only(VizEventIterator &viz_iter) {
+    write_metadata();
+
+    while (viz_iter.has_next()) {
+        const VizEvent &ve = viz_iter.peek();
+        double ts = aligner_.align_viz(ve.ts_us);
+        if (passes_filter(static_cast<int32_t>(ve.pid)) &&
+            passes_name_filter(static_cast<int32_t>(ve.tid)) &&
+            passes_time_filter(ts) &&
+            (ve.ph != 'X' || ve.dur_us >= opts_.min_duration_us)) {
+            std::string_view args = ve.args_json.empty() ? "{}" :
+                std::string_view(ve.args_json);
+            std::string_view cat = ve.cat.empty() ? "python" :
+                std::string_view(ve.cat);
+
+            std::string_view event_name = ve.name;
+            std::string cleaned_name;
+            if (event_name.substr(0, 11) == "THREAD_MAP:") {
+                cleaned_name = clean_thread_map_name(event_name);
+                event_name = cleaned_name;
+            }
+
+            writer_.write_viz_event(ve.ph, event_name, cat,
+                                    ts, ve.dur_us, ve.pid, ve.tid, args);
+            viz_written_++;
+        }
+        viz_iter.advance();
+        if (opts_.verbose) maybe_report_progress();
+    }
+    if (opts_.verbose) {
+        fmt::print(stderr, "\nWrote {} viz events\n", viz_written_);
+    }
+}
+
+// --- Vector-based overloads (backward compat, used by old code paths) ---
+
 void MergeEngine::write_viz_only(const std::vector<VizEvent> &viz_events) {
     build_viz_name_map(viz_events);
     compute_time_bounds(viz_events);

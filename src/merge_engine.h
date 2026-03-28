@@ -48,14 +48,22 @@ public:
     void add_perf_events(std::vector<PerfEvent> events,
                          const std::unordered_map<int32_t, std::string> &comm_map);
 
-    // Run the merge, reading VizTracer events from the callback
+    // Set pre-scanned viz metadata (call before merge_viz_events)
+    void set_viz_metadata(
+        const std::vector<VizEvent> &metadata_events,
+        const std::unordered_map<int64_t, int32_t> &tid_to_pid,
+        double viz_min_ts_us, double viz_max_ts_us);
+
+    // Streaming merge: consume viz events from an iterator
+    void merge_viz_events(VizEventIterator &viz_iter);
+    void write_viz_only(VizEventIterator &viz_iter);
+
+    // Vector-based merge (backward compat, wraps iterator version)
     void merge_viz_events(const std::vector<VizEvent> &viz_events);
+    void write_viz_only(const std::vector<VizEvent> &viz_events);
 
     // Write just perf events (no viz)
     void write_perf_only();
-
-    // Write just viz events (no perf)
-    void write_viz_only(const std::vector<VizEvent> &viz_events);
 
     uint64_t perf_events_written() const { return perf_written_; }
     uint64_t viz_events_written() const { return viz_written_; }
