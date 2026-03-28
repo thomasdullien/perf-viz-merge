@@ -14,6 +14,11 @@ Perfetto native protobuf traces.
 - Run tests with `make test` (requires `trace_processor_shell` in PATH).
 - Keep the `OutputWriter` interface abstract — `PerfettoWriter` and
   `TraceWriter` implement it, plus `ChunkingWriter` wraps it.
+- **Never allow data races in concurrent code.** All shared mutable state
+  accessed by multiple threads must use proper synchronization (atomics with
+  correct memory ordering, mutexes, or lock-free algorithms). Do not write
+  code that "allows a small race" — if you believe a race is acceptable,
+  flag it explicitly for review and do not proceed without confirmation.
 
 ## Build
 
