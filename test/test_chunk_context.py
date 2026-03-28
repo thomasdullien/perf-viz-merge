@@ -114,7 +114,7 @@ def test_context_spans_present():
         assert len(chunks) == 3, f"Expected 3 chunks, got {len(chunks)}: {chunks}"
 
         # Check verbose output for context spans
-        assert "context spans carried" in stderr, \
+        assert "context spans" in stderr, \
             f"Expected context span messages in output:\n{stderr}"
 
         # Chunk 1 (5s-10s) should have context spans from main() and outer()
@@ -159,12 +159,12 @@ def test_context_spans_correct_count():
         # = 2 context spans for chunk 2
 
         lines = stderr.split("\n")
-        ctx_lines = [l for l in lines if "context spans carried" in l]
+        ctx_lines = [l for l in lines if "context spans" in l]
 
         # Extract counts
         counts = []
         for l in ctx_lines:
-            # Format: "  N context spans carried from previous chunk"
+            # Format: "  N context spans from open stacks"
             parts = l.strip().split()
             counts.append(int(parts[0]))
 

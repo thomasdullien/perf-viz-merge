@@ -560,33 +560,8 @@ int main(int argc, char *argv[]) {
                 chunk_duration_us, global_min_us,
                 stem, ext, num_chunks, opts.verbose);
 
-            // Set up context span injection for boundary-crossing viz events
-            chunker->set_context_callback(
-                [&](int chunk_idx, double chunk_start_us, double chunk_end_us,
-                    OutputWriter &writer) {
-                    if (chunk_idx == 0) return;  // first chunk has no context
-                    int count = 0;
-                    for (const auto &ve : viz_events) {
-                        if (ve.ph != 'X') continue;
-                        double aligned_ts = aligner.align_viz(ve.ts_us);
-                        double event_end = aligned_ts + ve.dur_us;
-                        if (aligned_ts < chunk_start_us && event_end > chunk_start_us) {
-                            double clamped_dur = event_end - chunk_start_us;
-                            if (event_end > chunk_end_us)
-                                clamped_dur = chunk_end_us - chunk_start_us;
-                            // Convert chunk_start back to viz time
-                            double clamped_ts = ve.ts_us + (chunk_start_us - aligned_ts);
-                            writer.write_complete(ve.name, ve.cat.empty() ? "python" : ve.cat,
-                                                  chunk_start_us, clamped_dur,
-                                                  ve.pid, ve.tid);
-                            count++;
-                        }
-                    }
-                    if (opts.verbose && count > 0) {
-                        fmt::print(stderr, "  {} context spans carried from previous chunk\n",
-                                   count);
-                    }
-                });
+            // Context spans are handled automatically by ChunkingWriter's
+            // per-thread open stack tracking — no external callback needed.
 
             // Run a single merge pass — the chunking writer handles file splitting
             MergeEngine engine(*chunker, aligner, opts);
