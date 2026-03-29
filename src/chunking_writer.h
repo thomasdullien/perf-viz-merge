@@ -94,13 +94,21 @@ public:
                          double ts_us, double dur_us,
                          int64_t pid, int64_t tid,
                          std::string_view args_json = "{}") override {
+        // Route metadata events through write_metadata() so they are
+        // cached for replay when subsequent chunks open.  Without this,
+        // viz 'M' events bypass caching and later chunks lose the real
+        // process/thread names.
+        if (ph == 'M') {
+            write_metadata(name, pid, tid, args_json);
+            total_events_++;
+            return;
+        }
+
         // Advance chunk first, then expire. Order matters: open_chunk
         // expires at the boundary time, preserving boundary-crossing spans
         // for context emission. The event-time expire cleans up after.
         maybe_advance_chunk(ts_us);
-        if (ph != 'M') {
-            expire_spans(tid, ts_us);
-        }
+        expire_spans(tid, ts_us);
 
         // For complete events, track in open stacks after chunk advance
         if (ph == 'X' && dur_us > 0) {

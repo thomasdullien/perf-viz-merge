@@ -335,6 +335,26 @@ def test_chunking(tmpdir: str, ftrc_path: str, perf_path: str,
         result.check(c1_count > 50,
                      f"Chunk 1 has context spans ({c1_count} total slices)")
 
+    # Verify that chunk 1 has correct thread/process names (not fallbacks).
+    # Regression test: viz metadata events must be cached by ChunkingWriter
+    # so that later chunks get proper names instead of "Process NNN".
+    if len(chunk_files) >= 2:
+        chunk1 = os.path.join(chunk_dir, chunk_files[1])
+        rows = tp_query_rows(chunk1,
+            "SELECT track.name FROM track "
+            "WHERE track.name LIKE 'MainThread%' "
+            "   OR track.name LIKE 'mcproc__%'")
+        track_names = [r["name"] for r in rows]
+        has_main = any(f"[{TID_MAIN}]" in n for n in track_names)
+        has_mc0 = any(f"[{TID_MCPROC0}]" in n for n in track_names)
+        has_mc1 = any(f"[{TID_MCPROC1}]" in n for n in track_names)
+        result.check(has_main,
+                     f"Chunk 1 has MainThread name (not fallback)")
+        result.check(has_mc0,
+                     f"Chunk 1 has mcproc__0 name (not fallback)")
+        result.check(has_mc1,
+                     f"Chunk 1 has mcproc__1 name (not fallback)")
+
 
 def main():
     # Verify prerequisites
