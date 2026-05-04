@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "metric_csv_reader.h"
 #include "output_writer.h"
 #include "perfetto_writer.h"
 
@@ -136,6 +137,36 @@ public:
 
     int chunks_written() const { return current_chunk_ + 1; }
 
+    // Inject the metric samples (CPU/GPU counters) so each chunk file gets
+    // the subset whose timestamps fall within its time window. Without this,
+    // the chunked output path silently drops --cpu-metrics / --gpu-metrics
+    // data because main.cpp's write_metrics is only called for non-chunked
+    // output. Call this once after construction, before merge_viz_events.
+    //
+    // Note: the constructor already opens chunk 0 before this is called, so
+    // we have to emit chunk 0's metrics here inline. Subsequent chunks
+    // (1..N-1) get their metrics from open_chunk() at chunk-boundary advance.
+    void set_metric_samples(std::vector<MetricSample> samples) {
+        metric_samples_ = std::move(samples);
+        if (!writer_ || metric_samples_.empty() || current_chunk_ < 0) return;
+        double chunk_start_us =
+            global_min_us_ + current_chunk_ * chunk_duration_us_;
+        double chunk_end_us =
+            global_min_us_ + (current_chunk_ + 1) * chunk_duration_us_;
+        size_t emitted = 0;
+        for (const auto &m : metric_samples_) {
+            if (m.ts_us < chunk_start_us) continue;
+            if (m.ts_us >= chunk_end_us) break;  // sorted by ts
+            writer_->write_counter(m.name, m.ts_us, m.value, 0);
+            emitted++;
+        }
+        if (verbose_ && emitted > 0) {
+            fmt::print(stderr,
+                       "  emitted {} metric samples to chunk {} (deferred)\n",
+                       emitted, current_chunk_);
+        }
+    }
+
 private:
     // A span that is currently open (started but not yet ended).
     struct OpenSpan {
@@ -202,6 +233,27 @@ private:
             writer_->write_metadata(m.name_key, m.pid, m.tid, m.args_json);
         }
 
+        // Emit metric counter samples (CPU/GPU) whose timestamps fall in
+        // this chunk's window. This is the fix for the bug where the
+        // chunked output path skipped --cpu-metrics / --gpu-metrics.
+        if (!metric_samples_.empty()) {
+            double chunk_start_us = global_min_us_ + idx * chunk_duration_us_;
+            double chunk_end_us =
+                global_min_us_ + (idx + 1) * chunk_duration_us_;
+            size_t emitted = 0;
+            for (const auto &m : metric_samples_) {
+                if (m.ts_us < chunk_start_us) continue;
+                if (m.ts_us >= chunk_end_us) break;  // sorted by ts
+                writer_->write_counter(m.name, m.ts_us, m.value, 0);
+                emitted++;
+            }
+            if (verbose_ && emitted > 0) {
+                fmt::print(stderr,
+                           "  emitted {} metric samples to chunk {}\n",
+                           emitted, idx);
+            }
+        }
+
         // Emit context spans from per-thread open stacks
         if (idx > 0) {
             double chunk_start_us = global_min_us_ + idx * chunk_duration_us_;
@@ -250,6 +302,7 @@ private:
     int current_chunk_ = -1;
     std::unique_ptr<PerfettoWriter> writer_;
     std::vector<CachedMetadata> cached_metadata_;
+    std::vector<MetricSample> metric_samples_;  // sorted by ts_us
     uint64_t total_events_ = 0;
 
     // Per-tid stack of currently-open complete (X) spans.

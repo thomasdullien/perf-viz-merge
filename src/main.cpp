@@ -36,6 +36,9 @@ static void usage(const char *prog) {
         "  --viz <path>           Path to VizTracer JSON file (may be repeated)\n"
         "  -o, --output <path>    Output file (default: merged.perfetto-trace)\n"
         "  --time-offset <us>     Manual time offset in microseconds\n"
+        "  --clock-monotonic      Assume both perf and viz use CLOCK_MONOTONIC\n"
+        "                         (no auto-detect, force offset=0; use viz time\n"
+        "                         range for chunking).\n"
         "  --filter-pid <pid>     Only include events for this PID\n"
         "  --filter-name <pat>    Only include events from threads/processes matching\n"
         "                         substring (may be repeated; matches are OR'd)\n"
@@ -86,6 +89,8 @@ int main(int argc, char *argv[]) {
         } else if (arg == "--time-offset") {
             time_offset = std::atof(next());
             has_time_offset = true;
+        } else if (arg == "--clock-monotonic") {
+            opts.force_clock_monotonic = true;
         } else if (arg == "--filter-pid") {
             opts.filter_pid = std::atoi(next());
         } else if (arg == "--filter-name") {
@@ -138,6 +143,9 @@ int main(int argc, char *argv[]) {
     ClockAligner aligner;
     if (has_time_offset) {
         aligner.set_manual_offset(time_offset);
+    }
+    if (opts.force_clock_monotonic) {
+        aligner.force_clock_monotonic();
     }
 
     // Read perf events
@@ -287,8 +295,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Auto-detect clock alignment if both sources are present
-    if (has_perf && has_viz && !has_time_offset) {
+    // Auto-detect clock alignment if both sources are present (unless the
+    // user has supplied --time-offset or --clock-monotonic, both of which
+    // pin the offset).
+    if (has_perf && has_viz && !has_time_offset && !opts.force_clock_monotonic) {
         uint64_t perf_first = perf_min_ts;
         uint64_t perf_last = perf_max_ts;
 
@@ -455,7 +465,14 @@ int main(int argc, char *argv[]) {
             double global_min_us = std::numeric_limits<double>::max();
             double global_max_us = std::numeric_limits<double>::lowest();
 
-            if (has_perf && perf_min_ts > 0) {
+            // In force_clock_monotonic mode with viz present, derive chunking
+            // range from viz only. Both sources share the clock, viz captures
+            // the actual workload duration, and any stray perf events outside
+            // this range (e.g. metadata records with bogus timestamps) get
+            // clamped to chunk 0 or the last chunk -- a couple of misplaced
+            // events instead of the whole perf stream piling into one chunk.
+            bool use_viz_only_for_range = opts.force_clock_monotonic && has_viz;
+            if (has_perf && perf_min_ts > 0 && !use_viz_only_for_range) {
                 double pmin = aligner.align_perf(perf_min_ts);
                 double pmax = aligner.align_perf(perf_max_ts);
                 if (pmin < global_min_us) global_min_us = pmin;
@@ -491,6 +508,13 @@ int main(int argc, char *argv[]) {
             auto chunker = std::make_unique<ChunkingWriter>(
                 chunk_duration_us, global_min_us,
                 stem, ext, num_chunks, opts.verbose);
+
+            // Inject metric samples so each chunk's open_chunk() emits the
+            // subset within its time window. Without this, --cpu-metrics
+            // and --gpu-metrics are silently dropped in chunked mode.
+            if (!metric_samples.empty()) {
+                chunker->set_metric_samples(metric_samples);
+            }
 
             // Context spans are handled automatically by ChunkingWriter's
             // per-thread open stack tracking — no external callback needed.

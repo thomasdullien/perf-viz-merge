@@ -30,6 +30,11 @@ struct MergeOptions {
     double time_start_s = -1;  // relative seconds from trace start (-1 = no limit)
     double time_end_s = -1;    // relative seconds from trace start (-1 = no limit)
     bool time_end_exclusive = false;  // if true, events at exactly time_end are excluded
+    // Force CLOCK_MONOTONIC mode: assume perf and viz use the same clock,
+    // skip auto-detection of clock offset, use viz time range as the
+    // chunking range (perf events outside that range are clamped, which is
+    // safe for stray metadata records).
+    bool force_clock_monotonic = false;
 };
 
 class MergeEngine {

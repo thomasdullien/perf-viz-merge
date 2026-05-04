@@ -17,6 +17,17 @@ public:
         manual_ = true;
     }
 
+    // Force CLOCK_MONOTONIC mode: both perf and viz are recorded with the
+    // same CLOCK_MONOTONIC clock, so no alignment is needed. detect() becomes
+    // a no-op. Use this when you control both perf record (via
+    // `-k CLOCK_MONOTONIC`) and the Python tracer (fasttracer always uses
+    // CLOCK_MONOTONIC). Avoids heuristic misfires when perf events have
+    // bogus near-zero timestamps from header/metadata records.
+    void force_clock_monotonic() {
+        offset_us_ = 0.0;
+        manual_ = true;
+    }
+
     // Auto-detect the offset from the timestamp ranges of both sources.
     // Call this after a first pass over both data sources.
     void detect(double perf_first_ns, double perf_last_ns,
